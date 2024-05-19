@@ -52,6 +52,7 @@ typedef struct unitTest {
 struct unitTestSuite {
     char *filename;
     unitTest *tests;
+    unitTestProc *testMain;
 } unitTestSuite[] = {
 """)
         for test_suite in test_suites:

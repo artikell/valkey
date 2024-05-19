@@ -21,6 +21,10 @@ int runTestSuite(struct unitTestSuite *test, int argc, char **argv, int flags) {
     int failed_tests = 0;
     printf("[" KBLUE "START" KRESET "] - %s\n", test->filename);
 
+    if (test->testMain) {
+        test->testMain(argc, argv, flags);
+    }
+
     for (int id = 0; test->tests[id].proc != NULL; id++) {
         test_num++;
         int test_result = (test->tests[id].proc(argc, argv, flags) != 0);
@@ -51,7 +55,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    int numtests = sizeof(unitTestSuite)/sizeof(struct unitTest);
+    int numtests = sizeof(unitTestSuite)/sizeof(struct unitTestSuite);
     int failed_num = 0, suites_executed = 0;
     for (int j = 0; j < numtests; j++) {
         if (file && strcasecmp(file, unitTestSuite[j].filename)) continue;

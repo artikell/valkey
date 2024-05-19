@@ -6930,7 +6930,6 @@ struct serverTest {
     int failed;
 } serverTests[] = {
     {"ziplist", ziplistTest},
-    {"quicklist", quicklistTest},
     {"zipmap", zipmapTest},
     {"dict", dictTest},
     {"listpack", listpackTest},

@@ -96,6 +96,16 @@ typedef struct quicklistBookmark {
 #   error unknown arch bits count
 #endif
 
+/* Maximum size in bytes of any multi-element listpack.
+ * Larger values will live in their own isolated listpacks.
+ * This is used only if we're limited by record count. when we're limited by
+ * size, the maximum limit is bigger, but still safe.
+ * 8k is a recommended / default size limit */
+#define SIZE_SAFETY_LIMIT 8192
+#define QL_MAX_BM ((1 << QL_BM_BITS)-1)
+
+#define quicklistAllowsCompression(_ql) ((_ql)->compress != 0)
+
 /* quicklist is a 40 byte struct (on 64-bit systems) describing a quicklist.
  * 'count' is the number of total entries.
  * 'len' is the number of quicklist nodes.
@@ -204,9 +214,11 @@ quicklistNode *quicklistBookmarkFind(quicklist *ql, const char *name);
 void quicklistBookmarksClear(quicklist *ql);
 int quicklistSetPackedThreshold(size_t sz);
 
-#ifdef SERVER_TEST
-int quicklistTest(int argc, char *argv[], int flags);
-#endif
+quicklistNode *quicklistCreateNode(void);
+size_t quicklistNodeNegFillLimit(int fill);
+quicklistNode* __quicklistCreateNode(int container, void *value, size_t sz);
+int __quicklistDecompressNode(quicklistNode *node);
+int __quicklistCompressNode(quicklistNode *node);
 
 /* Directions for iterators */
 #define AL_START_HEAD 0
