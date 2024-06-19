@@ -1177,6 +1177,95 @@ start_server {
         assert_equal [dict get $group lag] 2
     }
 
+    test {Consumer group lag with with tombstone V1} {
+        r DEL x
+        r XGROUP CREATE x processing $ MKSTREAM
+        r XADD x 0-1 name Mercury
+        r XADD x 0-2 name Venus
+        r XREADGROUP GROUP processing alice STREAMS x >
+        r XADD x 0-3 name Earth
+        r XADD x 0-4 name Jupiter
+
+        r XDEL x 0-3
+
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        puts $group
+    }
+
+    test {Consumer group lag with with tombstone V1} {
+        r DEL x
+        r XGROUP CREATE x processing $ MKSTREAM
+        r XADD x 0-1 name Mercury
+        r XADD x 0-2 name Venus
+        r XADD x 0-3 name Earth
+        r XADD x 0-4 name Jupiter
+
+        r XREADGROUP GROUP processing alice COUNT 2 STREAMS x >
+
+        r XDEL x 0-3
+
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        puts $group
+    }
+
+    test {Consumer group lag with with tombstone V2} {
+        r DEL x
+        r XGROUP CREATE x processing $ MKSTREAM
+        r XADD x 0-1 name Mercury
+        r XADD x 0-2 name Venus
+        r XADD x 0-3 name Earth
+        r XADD x 0-4 name Jupiter
+
+        r XDEL x 0-3
+
+        r XREADGROUP GROUP processing alice COUNT 2 STREAMS x >
+
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        puts $group
+    }
+
+    test {Consumer group lag with with tombstone} {
+        r DEL x
+        r XGROUP CREATE x processing $ MKSTREAM
+        r XADD x 0-1 name Mercury
+        r XADD x 0-2 name Venus
+        r XREADGROUP GROUP processing alice STREAMS x >
+        r XADD x 0-3 name Earth
+        r XADD x 0-4 name Jupiter
+
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        assert_equal [dict get $group entries-read] 2
+        assert_equal [dict get $group lag] 2
+
+        r XDEL x 0-1
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        assert_equal [dict get $group entries-read] 2
+        assert_equal [dict get $group lag] 2
+
+        r XDEL x 0-2
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        assert_equal [dict get $group entries-read] 2
+        assert_equal [dict get $group lag] 2
+
+        r XDEL x 0-3
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        assert_equal [dict get $group entries-read] 2
+        assert_equal [dict get $group lag] {}
+
+        r XDEL x 0-4
+        set reply [r XINFO STREAM x FULL]
+        set group [lindex [dict get $reply groups] 0]
+        assert_equal [dict get $group entries-read] 2
+        assert_equal [dict get $group lag] 0
+    }
+
     test {Loading from legacy (Redis <= v6.2.x, rdb_ver < 10) persistence} {
         # The payload was DUMPed from a v5 instance after:
         # XADD x 1-0 data a

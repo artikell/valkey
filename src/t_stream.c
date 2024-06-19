@@ -1388,13 +1388,8 @@ int streamIDEqZero(streamID *id) {
 int streamRangeHasTombstones(stream *s, streamID *start, streamID *end) {
     streamID start_id, end_id;
 
-    if (!s->length || streamIDEqZero(&s->max_deleted_entry_id)) {
+    if (streamIDEqZero(&s->max_deleted_entry_id)) {
         /* The stream is empty or has no tombstones. */
-        return 0;
-    }
-
-    if (streamCompareID(&s->first_id, &s->max_deleted_entry_id) > 0) {
-        /* The latest tombstone is before the first entry. */
         return 0;
     }
 
@@ -1485,9 +1480,13 @@ long long streamEstimateDistanceFromFirstEverEntry(stream *s, streamID *id) {
 
     /* In the empty stream, if the ID is smaller or equal to the last ID,
      * it can set to the current added_entries value. */
-    if (!s->length && streamCompareID(id, &s->last_id) < 1) {
+    if (!s->length && streamCompareID(id,&s->last_id) < 1) {
         return s->entries_added;
     }
+
+    /* There are fragmentations between the `id` and the stream's last-generated-id. */
+    if (!streamIDEqZero(id) && streamCompareID(id,&s->max_deleted_entry_id) < 0)
+        return SCG_INVALID_ENTRIES_READ;
 
     int cmp_last = streamCompareID(id, &s->last_id);
     if (cmp_last == 0) {
@@ -1499,7 +1498,7 @@ long long streamEstimateDistanceFromFirstEverEntry(stream *s, streamID *id) {
     }
 
     int cmp_id_first = streamCompareID(id, &s->first_id);
-    int cmp_xdel_first = streamCompareID(&s->max_deleted_entry_id, &s->first_id);
+    int cmp_xdel_first = streamCompareID(&s->max_deleted_entry_id,&s->first_id);
     if (streamIDEqZero(&s->max_deleted_entry_id) || cmp_xdel_first < 0) {
         /* There's definitely no fragmentation ahead. */
         if (cmp_id_first < 0) {
@@ -1677,7 +1676,7 @@ size_t streamReplyWithRange(client *c,
     while (streamIteratorGetID(&si, &id, &numfields)) {
         /* Update the group last_id if needed. */
         if (group && streamCompareID(&id, &group->last_id) > 0) {
-            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s, &id, NULL)) {
+            if (group->entries_read != SCG_INVALID_ENTRIES_READ && !streamRangeHasTombstones(s, &group->last_id, NULL)) {
                 /* A valid counter and no future tombstones mean we can
                  * increment the read counter to keep tracking the group's
                  * progress. */
