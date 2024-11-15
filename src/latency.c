@@ -264,7 +264,7 @@ sds createLatencyReport(void) {
             }
             report = sdscatprintf(report, " Fork rate is %.2f GB/sec (%s).", server.stat_fork_rate, fork_quality);
         }
-
+#ifndef _ENGINE_DISABLE_SLOWLOG
         /* Potentially commands. */
         if (!strcasecmp(event, "command")) {
             if (server.slowlog_log_slower_than < 0 || server.slowlog_max_len == 0) {
@@ -278,7 +278,7 @@ sds createLatencyReport(void) {
             advise_large_objects = 1;
             advices += 2;
         }
-
+#endif
         /* fast-command. */
         if (!strcasecmp(event, "fast-command")) {
             advise_scheduler = 1;

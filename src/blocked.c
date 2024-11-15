@@ -116,8 +116,10 @@ void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_err
     if (had_errors) c->lastcmd->failed_calls++;
     if (server.latency_tracking_enabled)
         updateCommandLatencyHistogram(&(c->lastcmd->latency_histogram), total_cmd_duration * 1000);
+#ifndef _ENGINE_DISABLE_SLOWLOG
     /* Log the command into the Slow log if needed. */
     slowlogPushCurrentCommand(c, c->lastcmd, total_cmd_duration);
+#endif
     c->duration = 0;
     /* Log the reply duration event. */
     latencyAddSampleIfNeeded("command-unblocking", reply_us / 1000);

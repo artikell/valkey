@@ -40,6 +40,7 @@
 
 #include "slowlog.h"
 
+#ifndef _ENGINE_DISABLE_SLOWLOG
 /* Create a new slowlog entry.
  * Incrementing the ref count of all the objects retained is up to
  * this function. */
@@ -191,3 +192,4 @@ void slowlogCommand(client *c) {
         addReplySubcommandSyntaxError(c);
     }
 }
+#endif

@@ -2853,7 +2853,9 @@ void initServer(void) {
         serverPanic("Functions initialization failed, check the server logs.");
         exit(1);
     }
+#ifndef _ENGINE_DISABLE_SLOWLOG
     slowlogInit();
+#endif
     latencyMonitorInit();
     initSharedQueryBuf();
 
@@ -3386,7 +3388,7 @@ void preventCommandAOF(client *c) {
 void preventCommandReplication(client *c) {
     c->flag.prevent_repl_prop = 1;
 }
-
+#ifndef _ENGINE_DISABLE_SLOWLOG
 /* Log the last command a client executed into the slowlog. */
 void slowlogPushCurrentCommand(client *c, struct serverCommand *cmd, ustime_t duration) {
     /* Some commands may contain sensitive data that should not be available in the slowlog. */
@@ -3405,6 +3407,7 @@ void slowlogPushCurrentCommand(client *c, struct serverCommand *cmd, ustime_t du
 
     slowlogPushEntryIfNeeded(c, argv, argc, duration);
 }
+#endif
 
 /* This function is called in order to update the total command histogram duration.
  * The latency unit is nano-seconds.
@@ -3655,11 +3658,11 @@ void call(client *c, int flags) {
         latencyAddSampleIfNeeded(latency_event, duration / 1000);
         if (server.execution_nesting == 0) durationAddSample(EL_DURATION_TYPE_CMD, duration);
     }
-
+#ifndef _ENGINE_DISABLE_SLOWLOG
     /* Log the command into the Slow log if needed.
      * If the client is blocked we will handle slowlog when it is unblocked. */
     if (update_command_stats && !c->flag.blocked) slowlogPushCurrentCommand(c, real_cmd, c->duration);
-
+#endif
     /* Send the command to clients in MONITOR mode if applicable,
      * since some administrative commands are considered too dangerous to be shown.
      * Other exceptions is a client which is unblocked and retrying to process the command
