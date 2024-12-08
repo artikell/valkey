@@ -1566,30 +1566,27 @@ lpNextRandom(unsigned char *lp, unsigned char *p, unsigned int *index, unsigned 
      * we pick it is the quotient of the count left we want to pick and the
      * count still we haven't visited. This way, we could make every member be
      * equally likely to be picked. */
+    if (remaining == 0) return NULL;
+
     unsigned int i = *index;
     unsigned int total_size = lpLength(lp);
-    while (i < total_size && p != NULL) {
-        if (even_only && i % 2 != 0) {
-            p = lpNext(lp, p);
-            i++;
-            continue;
-        }
+    int remaining_count = (remaining - 1) * (even_only? 2 : 1);
 
-        /* Do we pick this element? */
-        unsigned int available = total_size - i;
-        if (even_only) available /= 2;
-        double randomDouble = ((double)rand()) / RAND_MAX;
-        double threshold = ((double)remaining) / available;
-        if (randomDouble <= threshold) {
-            *index = i;
-            return p;
-        }
-
-        p = lpNext(lp, p);
+    if (even_only && i % 2 != 0) {
+        if (p == NULL) return NULL;
         i++;
     }
 
-    return NULL;
+    int available_count = total_size - remaining_count - i;
+    if (available_count <= 0) available_count = 1;
+
+    int select_index = (rand() % available_count);
+    if (even_only) {
+        select_index = select_index & (~1);
+    }
+
+    *index = i + select_index;
+    return lpSeek(lp, *index);
 }
 
 /* Print info of listpack which is used in debugCommand */
