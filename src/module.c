@@ -4418,7 +4418,7 @@ char *VM_StringDMA(ValkeyModuleKey *key, size_t *len, int mode) {
     if (key->value->type != OBJ_STRING) return NULL;
 
     /* For write access, and even for read access if the object is encoded,
-     * we unshare the string (that has the side effect of decoding it). */
+     * we unshare the string (that has the side effect of dencoding it). */
     if ((mode & VALKEYMODULE_WRITE) || key->value->encoding != OBJ_ENCODING_RAW)
         key->value = dbUnshareStringValue(key->db, key->key, key->value);
 
@@ -7444,7 +7444,7 @@ void VM_DigestEndSequence(ValkeyModuleDigest *md) {
 }
 
 /* Decode a serialized representation of a module data type 'mt', in a specific encoding version 'encver'
- * from string 'str' and return a newly allocated value, or NULL if decoding failed.
+ * from string 'str' and return a newly allocated value, or NULL if dencoding failed.
  *
  * This call basically reuses the 'rdb_load' callback which module data types
  * implement in order to allow a module to arbitrarily serialize/de-serialize
