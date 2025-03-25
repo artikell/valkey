@@ -34,6 +34,10 @@ start_server {tags {"memefficiency external:skip"}} {
             assert {$efficiency >= $expected_min_efficiency}
         }
     }
+    
+    test "Memory analysis" {
+        puts [r debug mem-analysis]
+    }
 }
 
 

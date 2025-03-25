@@ -3387,6 +3387,8 @@ long long getModuleNumericConfig(ModuleConfig *module_config);
 int setModuleNumericConfig(ModuleConfig *config, long long val, const char **err);
 
 /* db.c -- Keyspace access API */
+extern char *obj_type_name[OBJ_TYPE_MAX];
+
 int removeExpire(serverDb *db, robj *key);
 void deleteExpiredKeyAndPropagate(serverDb *db, robj *keyobj);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);

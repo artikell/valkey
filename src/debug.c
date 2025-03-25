@@ -389,6 +389,40 @@ void mallctl_string(client *c, robj **argv, int argc) {
 }
 #endif
 
+extern size_t objectComputeSize(robj *key, robj *o, size_t sample_size, int dbid);
+
+void debugMemScanDatabaseCallback(void *privdata, void *entry) {
+    long long* used_mem = (long long *)privdata;
+    int dbid = server.current_client->db->id;
+    robj *obj = entry;
+    used_mem[obj->type] += objectComputeSize(NULL, obj, LLONG_MAX, dbid);
+}
+
+void memAnalysis(client *c) {
+    long long used_mem[OBJ_TYPE_MAX] = {0};
+    int arraylen = 0;
+    long long used_mem_all = 0;
+    unsigned long cursor = 0;
+    do {
+        cursor = kvstoreScan(c->db->keys, cursor, -1, debugMemScanDatabaseCallback, NULL, &used_mem);
+    } while (cursor);
+
+    void *arraylen_ptr = addReplyDeferredLen(c);
+    for (int i = 0; i < OBJ_TYPE_MAX; i++) {
+        used_mem_all += used_mem[i];
+
+        addReplyBulkCString(c, obj_type_name[i]);
+        addReplyLongLong(c, used_mem[i]);
+        arraylen += 2;
+    }
+
+    addReplyBulkCString(c, "used_mem_all");
+    addReplyLongLong(c, used_mem_all);
+    arraylen += 2;
+
+    setDeferredArrayLen(c, arraylen_ptr, arraylen);
+}
+
 void debugCommand(client *c) {
     if (c->argc == 2 && !strcasecmp(c->argv[1]->ptr, "help")) {
         const char *help[] = {
@@ -1020,6 +1054,8 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
         server.dict_resizing = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "mem-analysis") && c->argc == 2) {
+        memAnalysis(c);
     } else if (!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
