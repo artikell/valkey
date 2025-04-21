@@ -856,89 +856,93 @@ static void showLatencyReport(void) {
     const float p99 = hdr_value_at_percentile(config.latency_histogram, 99.0) / 1000.0f;
     const float p100 = ((float)hdr_max(config.latency_histogram)) / 1000.0f;
     const float avg = hdr_mean(config.latency_histogram) / 1000.0f;
-
-    if (!config.quiet && !config.csv) {
-        printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
-        printf("====== %s ======\n", config.title);
-        printf("  %d requests completed in %.2f seconds\n", config.requests_finished, (float)config.totlatency / 1000);
-        printf("  %d parallel clients\n", config.numclients);
-        printf("  %d bytes payload\n", config.datasize);
-        printf("  keep alive: %d\n", config.keepalive);
-        if (config.cluster_mode) {
-            const char *node_roles = NULL;
-            if (config.read_from_replica == FROM_ALL) {
-                node_roles = "cluster";
-            } else if (config.read_from_replica == FROM_REPLICA_ONLY) {
-                node_roles = "replica";
-            } else {
-                node_roles = "primary";
-            }
-            printf("  cluster mode: yes (%d %s)\n", config.cluster_node_count, node_roles);
-            int m;
-            for (m = 0; m < config.cluster_node_count; m++) {
-                clusterNode *node = config.cluster_nodes[m];
-                serverConfig *cfg = node->redis_config;
-                if (cfg == NULL) continue;
-                printf("  node [%d] configuration:\n", m);
-                printf("    save: %s\n", sdslen(cfg->save) ? cfg->save : "NONE");
-                printf("    appendonly: %s\n", cfg->appendonly);
-            }
-        } else {
-            if (config.redis_config) {
-                printf("  host configuration \"save\": %s\n", config.redis_config->save);
-                printf("  host configuration \"appendonly\": %s\n", config.redis_config->appendonly);
-            }
-        }
-        printf("  multi-thread: %s\n", (config.num_threads ? "yes" : "no"));
-        if (config.num_threads) printf("  threads: %d\n", config.num_threads);
-
-        printf("\n");
-        printf("Latency by percentile distribution:\n");
-        struct hdr_iter iter;
-        long long previous_cumulative_count = -1;
-        const long long total_count = config.latency_histogram->total_count;
-        hdr_iter_percentile_init(&iter, config.latency_histogram, 1);
-        struct hdr_iter_percentiles *percentiles = &iter.specifics.percentiles;
-        while (hdr_iter_next(&iter)) {
-            const double value = iter.highest_equivalent_value / 1000.0f;
-            const double percentile = percentiles->percentile;
-            const long long cumulative_count = iter.cumulative_count;
-            if (previous_cumulative_count != cumulative_count || cumulative_count == total_count) {
-                printf("%3.3f%% <= %.3f milliseconds (cumulative count %lld)\n", percentile, value, cumulative_count);
-            }
-            previous_cumulative_count = cumulative_count;
-        }
-        printf("\n");
-        printf("Cumulative distribution of latencies:\n");
-        previous_cumulative_count = -1;
-        hdr_iter_linear_init(&iter, config.latency_histogram, 100);
-        while (hdr_iter_next(&iter)) {
-            const double value = iter.highest_equivalent_value / 1000.0f;
-            const long long cumulative_count = iter.cumulative_count;
-            const double percentile = ((double)cumulative_count / (double)total_count) * 100.0;
-            if (previous_cumulative_count != cumulative_count || cumulative_count == total_count) {
-                printf("%3.3f%% <= %.3f milliseconds (cumulative count %lld)\n", percentile, value, cumulative_count);
-            }
-            /* After the 2 milliseconds latency to have percentages split
-             * by decimals will just add a lot of noise to the output. */
-            if (iter.highest_equivalent_value > 2000) {
-                hdr_iter_linear_set_value_units_per_bucket(&iter, 1000);
-            }
-            previous_cumulative_count = cumulative_count;
-        }
-        printf("\n");
-        printf("Summary:\n");
-        printf("  throughput summary: %.2f requests per second\n", reqpersec);
-        printf("  latency summary (msec):\n");
-        printf("    %9s %9s %9s %9s %9s %9s\n", "avg", "min", "p50", "p95", "p99", "max");
-        printf("    %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n", avg, p0, p50, p95, p99, p100);
-    } else if (config.csv) {
-        printf("\"%s\",\"%.2f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\"\n", config.title, reqpersec, avg,
-               p0, p50, p95, p99, p100);
-    } else {
+    
+    if (config.quiet) {
         printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
         printf("%s: %.2f requests per second, p50=%.3f msec\n", config.title, reqpersec, p50);
+        return;
     }
+
+    if (config.csv) {
+        printf("\"%s\",\"%.2f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\",\"%.3f\"\n", config.title, reqpersec, avg,
+            p0, p50, p95, p99, p100);
+        return;
+    }
+    
+    printf("%*s\r", config.last_printed_bytes, " "); // ensure there is a clean line
+    printf("====== %s ======\n", config.title);
+    printf("  %d requests completed in %.2f seconds\n", config.requests_finished, (float)config.totlatency / 1000);
+    printf("  %d parallel clients\n", config.numclients);
+    printf("  %d bytes payload\n", config.datasize);
+    printf("  keep alive: %d\n", config.keepalive);
+    if (config.cluster_mode) {
+        const char *node_roles = NULL;
+        if (config.read_from_replica == FROM_ALL) {
+            node_roles = "cluster";
+        } else if (config.read_from_replica == FROM_REPLICA_ONLY) {
+            node_roles = "replica";
+        } else {
+            node_roles = "primary";
+        }
+        printf("  cluster mode: yes (%d %s)\n", config.cluster_node_count, node_roles);
+        int m;
+        for (m = 0; m < config.cluster_node_count; m++) {
+            clusterNode *node = config.cluster_nodes[m];
+            serverConfig *cfg = node->redis_config;
+            if (cfg == NULL) continue;
+            printf("  node [%d] configuration:\n", m);
+            printf("    save: %s\n", sdslen(cfg->save) ? cfg->save : "NONE");
+            printf("    appendonly: %s\n", cfg->appendonly);
+        }
+    } else {
+        if (config.redis_config) {
+            printf("  host configuration \"save\": %s\n", config.redis_config->save);
+            printf("  host configuration \"appendonly\": %s\n", config.redis_config->appendonly);
+        }
+    }
+    printf("  multi-thread: %s\n", (config.num_threads ? "yes" : "no"));
+    if (config.num_threads) printf("  threads: %d\n", config.num_threads);
+
+    printf("\n");
+    printf("Latency by percentile distribution:\n");
+    struct hdr_iter iter;
+    long long previous_cumulative_count = -1;
+    const long long total_count = config.latency_histogram->total_count;
+    hdr_iter_percentile_init(&iter, config.latency_histogram, 1);
+    struct hdr_iter_percentiles *percentiles = &iter.specifics.percentiles;
+    while (hdr_iter_next(&iter)) {
+        const double value = iter.highest_equivalent_value / 1000.0f;
+        const double percentile = percentiles->percentile;
+        const long long cumulative_count = iter.cumulative_count;
+        if (previous_cumulative_count != cumulative_count || cumulative_count == total_count) {
+            printf("%3.3f%% <= %.3f milliseconds (cumulative count %lld)\n", percentile, value, cumulative_count);
+        }
+        previous_cumulative_count = cumulative_count;
+    }
+    printf("\n");
+    printf("Cumulative distribution of latencies:\n");
+    previous_cumulative_count = -1;
+    hdr_iter_linear_init(&iter, config.latency_histogram, 100);
+    while (hdr_iter_next(&iter)) {
+        const double value = iter.highest_equivalent_value / 1000.0f;
+        const long long cumulative_count = iter.cumulative_count;
+        const double percentile = ((double)cumulative_count / (double)total_count) * 100.0;
+        if (previous_cumulative_count != cumulative_count || cumulative_count == total_count) {
+            printf("%3.3f%% <= %.3f milliseconds (cumulative count %lld)\n", percentile, value, cumulative_count);
+        }
+        /* After the 2 milliseconds latency to have percentages split
+            * by decimals will just add a lot of noise to the output. */
+        if (iter.highest_equivalent_value > 2000) {
+            hdr_iter_linear_set_value_units_per_bucket(&iter, 1000);
+        }
+        previous_cumulative_count = cumulative_count;
+    }
+    printf("\n");
+    printf("Summary:\n");
+    printf("  throughput summary: %.2f requests per second\n", reqpersec);
+    printf("  latency summary (msec):\n");
+    printf("    %9s %9s %9s %9s %9s %9s\n", "avg", "min", "p50", "p95", "p99", "max");
+    printf("    %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n", avg, p0, p50, p95, p99, p100);
 }
 
 static void initBenchmarkThreads(void) {
@@ -1692,18 +1696,7 @@ int test_is_selected(const char *name) {
     return strstr(config.tests, buf) != NULL;
 }
 
-int main(int argc, char **argv) {
-    int i;
-    char *data, *cmd, *tag;
-    int len;
-
-    client c;
-
-    srandom(time(NULL) ^ getpid());
-    init_genrand64(ustime() ^ getpid());
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-
+void config_init(void) {
     memset(&config.sslconfig, 0, sizeof(config.sslconfig));
     config.numclients = 50;
     config.requests = 100000;
@@ -1743,23 +1736,35 @@ int main(int argc, char **argv) {
     config.num_functions = 10;
     config.num_keys_in_fcall = 1;
     config.resp3 = 0;
+    return;
+}
 
-    i = parseOptions(argc, argv);
-    argc -= i;
-    argv += i;
-
-    tag = "";
-
+void benchmark_init(int argc, char **argv) {
+    UNUSED(argc);
+    UNUSED(argv);
 #ifdef USE_OPENSSL
     if (config.tls) {
         cliSecureInit();
     }
 #endif
+    if (config.num_threads > 0) {
+        pthread_mutex_init(&(config.liveclients_mutex), NULL);
+        pthread_mutex_init(&(config.is_updating_slots_mutex), NULL);
+    }
 
+    if (config.keepalive == 0) {
+        fprintf(stderr, "WARNING: Keepalive disabled. You probably need "
+                        "'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' for Linux and "
+                        "'sudo sysctl -w net.inet.tcp.msl=1000' for Mac OS X in order "
+                        "to use a lot of clients/requests\n");
+    }
+    if (argc > 0 && config.tests != NULL) {
+        fprintf(stderr, "WARNING: Option -t is ignored.\n");
+    }
+}
+
+void server_env_show(void) {
     if (config.cluster_mode) {
-        // We only include the slot placeholder {tag} if cluster mode is enabled
-        tag = ":{tag}";
-
         /* Fetch cluster configuration. */
         if (!fetchClusterConfiguration() || !config.cluster_nodes) {
             if (!config.hostsocket) {
@@ -1814,43 +1819,62 @@ int main(int argc, char **argv) {
             fprintf(stderr, "WARNING: Could not fetch server CONFIG\n");
         }
     }
-    if (config.num_threads > 0) {
-        pthread_mutex_init(&(config.liveclients_mutex), NULL);
-        pthread_mutex_init(&(config.is_updating_slots_mutex), NULL);
-    }
+}
 
-    if (config.keepalive == 0) {
-        fprintf(stderr, "WARNING: Keepalive disabled. You probably need "
-                        "'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse' for Linux and "
-                        "'sudo sysctl -w net.inet.tcp.msl=1000' for Mac OS X in order "
-                        "to use a lot of clients/requests\n");
+void benchmark_idle(void) {
+    client c;
+    printf("Creating %d idle connections and waiting forever (Ctrl+C when done)\n", config.numclients);
+    int thread_id = -1, use_threads = (config.num_threads > 0);
+    if (use_threads) {
+        thread_id = 0;
+        initBenchmarkThreads();
     }
-    if (argc > 0 && config.tests != NULL) {
-        fprintf(stderr, "WARNING: Option -t is ignored.\n");
-    }
+    c = createClient("", 0, NULL, thread_id); /* will never receive a reply */
+    createMissingClients(c);
+    if (use_threads)
+        startBenchmarkThreads();
+    else
+        aeMain(config.el);
+    /* and will wait for every */
+}
 
+int main(int argc, char **argv) {
+    int i;
+    char *data, *cmd, *tag;
+    int len;
+
+    srandom(time(NULL) ^ getpid());
+    init_genrand64(ustime() ^ getpid());
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    config_init();
+
+    i = parseOptions(argc, argv);
+    argc -= i;
+    argv += i;
+
+    tag = "";
+    
+    benchmark_init(argc, argv);
+    
+    server_env_show();
+    
+    if (config.cluster_mode) {
+        tag = ":{tag}";
+    }
     if (config.idlemode) {
-        printf("Creating %d idle connections and waiting forever (Ctrl+C when done)\n", config.numclients);
-        int thread_id = -1, use_threads = (config.num_threads > 0);
-        if (use_threads) {
-            thread_id = 0;
-            initBenchmarkThreads();
-        }
-        c = createClient("", 0, NULL, thread_id); /* will never receive a reply */
-        createMissingClients(c);
-        if (use_threads)
-            startBenchmarkThreads();
-        else
-            aeMain(config.el);
-        /* and will wait for every */
+        benchmark_idle();
     }
     if (config.csv) {
         printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_"
                "latency_ms\",\"max_latency_ms\"\n");
     }
+
+    sds title = NULL;
     /* Run benchmark with command in the remainder of the arguments. */
     if (argc) {
-        sds title = sdsnew(argv[0]);
+        title = sdsnew(argv[0]);
         for (i = 1; i < argc; i++) {
             title = sdscatlen(title, " ", 1);
             title = sdscatlen(title, (char *)argv[i], strlen(argv[i]));
