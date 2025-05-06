@@ -3173,11 +3173,11 @@ static int setLttngMask(standardConfig *config, sds *argv, int argc, const char 
         }
     }
     trace_mask = mask;
-    sdsclear(server.lttng_trace_mask);
+    sdsclear(server.trace_events);
     for (int i = 0; i < argc; i++) {
-        server.lttng_trace_mask = sdscatprintf(server.lttng_trace_mask, "%s", argv[i]);
+        server.trace_events = sdscatprintf(server.trace_events, "%s", argv[i]);
         if (i != argc - 1) {
-            server.lttng_trace_mask = sdscatlen(server.lttng_trace_mask, " ", 1);
+            server.trace_events = sdscatlen(server.trace_events, " ", 1);
         }
     }
     return 1;
@@ -3187,18 +3187,18 @@ configerr:
 
 static sds getLttngMask(standardConfig *config) {
     UNUSED(config);
-    return sdsdup(server.lttng_trace_mask);
+    return sdsdup(server.trace_events);
 }
 
 void rewriteLttngMask(standardConfig *config,
     const char *name,
     struct rewriteConfigState *state) {
     UNUSED(config);
-    if (sdslen(server.lttng_trace_mask) == 0) {
+    if (sdslen(server.trace_events) == 0) {
         rewriteConfigMarkAsProcessed(state, name);
         return;
     }
-    rewriteConfigRewriteLine(state, name, sdsdup(server.lttng_trace_mask), 1);
+    rewriteConfigRewriteLine(state, name, sdsdup(server.trace_events), 1);
 }
 
 standardConfig static_configs[] = {
@@ -3254,7 +3254,6 @@ standardConfig static_configs[] = {
     createBoolConfig("hide-user-data-from-log", NULL, MODIFIABLE_CONFIG, server.hide_user_data_from_log, 1, NULL, NULL),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
     createBoolConfig("auto-failover-on-shutdown", NULL, MODIFIABLE_CONFIG, server.auto_failover_on_shutdown, 0, NULL, NULL),
-    createBoolConfig("lttng-enabled", NULL, MODIFIABLE_CONFIG, server.lttng_enabled, 0, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),

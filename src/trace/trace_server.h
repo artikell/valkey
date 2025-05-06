@@ -12,23 +12,24 @@
 #include <lttng/tracepoint.h>
 
 LTTNG_UST_TRACEPOINT_EVENT(
-    /* Tracepoint provider name */
-    valkey_server,
+	/* Tracepoint provider name */
+	valkey_server,
 
-    /* Tracepoint name */
-    latency,
+	/* Tracepoint name */
+	latency,
 
-    /* Input arguments */
-    LTTNG_UST_TP_ARGS(
-        const char *,
-        event,
-        uint64_t,
-        duration),
+	/* Input arguments */
+	LTTNG_UST_TP_ARGS(
+		const char *, event,
+		uint64_t, duration
+	),
 
-    /* Output event fields */
-    LTTNG_UST_TP_FIELDS(
-        lttng_ust_field_string(event, event)
-            lttng_ust_field_integer(uint64_t, duration, duration)))
+	/* Output event fields */
+	LTTNG_UST_TP_FIELDS(
+		lttng_ust_field_string(event, event)
+		lttng_ust_field_integer(uint64_t, duration, duration)
+	)
+)
 
 #define valkey_server_trace(...) lttng_ust_tracepoint(__VA_ARGS__)
 
@@ -46,7 +47,7 @@ static inline void __valkey_server_trace(void) {
 }
 
 #define valkey_server_trace(...) \
-    do {                         \
+    do {                     \
     } while (0)
 
 #endif /* __VALKEY_TRACE_SERVER_H__ */

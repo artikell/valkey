@@ -21,10 +21,10 @@ typedef struct valkeyTraceMask {
 extern struct valkeyTraceMask trace_mask;
 
 #ifdef USE_LTTNG
-#define lttngLatencyTraceIfNeeded(type, event, var) \
-    if (server.lttng_enabled && trace_mask.type) valkey_##type##_trace(valkey_##type, "latency", (event), (var));
+#define latencyTraceIfNeeded(type, event, var) \
+    if (trace_mask.type) valkey_##type##_trace(valkey_##type, "latency", (event), (var));
 #else
-#define lttngLatencyTraceIfNeeded(type, event, var) \
+#define latencyTraceIfNeeded(type, event, var) \
     do {                                            \
     } while (0)
 #endif

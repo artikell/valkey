@@ -70,8 +70,7 @@ int THPGetAnonHugePagesSize(void) {
  * having a fixed list to maintain. */
 void latencyMonitorInit(void) {
     server.latency_events = dictCreate(&latencyTimeSeriesDictType);
-    server.lttng_trace_mask = sdsempty();
-    server.lttng_enabled = 0;
+    server.trace_events = sdsempty();
 }
 
 /* Add the specified sample to the specified time series "event".
