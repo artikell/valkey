@@ -41,7 +41,7 @@ extern struct valkeyTraceEvents trace_events;
     if (trace_events.type) valkey_##type##_trace(valkey_##type, latency, (event), (var));
 #else
 #define latencyTraceIfNeeded(type, event, var) \
-    do {                                            \
+    do {                                       \
     } while (0)
 #endif
 
