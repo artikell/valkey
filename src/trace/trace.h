@@ -1,5 +1,5 @@
 /* ==========================================================================
- * trace.h - support tracing for transport layer.
+ * trace.h - support generic tracing layers.
  * --------------------------------------------------------------------------
  * Copyright (C) 2025  zhiqiang li <lizhiqiang.sf@bytedance.com>
  *

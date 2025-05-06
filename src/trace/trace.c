@@ -1,5 +1,5 @@
 /* ==========================================================================
- * trace.c - support tracing for transport layer.
+ * trace.c - support generic tracing layers.
  * --------------------------------------------------------------------------
  * Copyright (C) 2025  zhiqiang li <lizhiqiang.sf@bytedance.com>
  *
