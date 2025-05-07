@@ -3173,7 +3173,7 @@ static int setTraceEvents(standardConfig *config, sds *argv, int argc, const cha
         }
     }
     // if events exists, set enabled to 1
-    if (argc > 0)   events.enabled = 1;
+    if (argc > 0) events.enabled = 1;
     trace_events = events;
     sdsclear(server.trace_events);
     for (int i = 0; i < argc; i++) {
@@ -3193,8 +3193,8 @@ static sds getTraceEvents(standardConfig *config) {
 }
 
 void rewriteTraceEvents(standardConfig *config,
-    const char *name,
-    struct rewriteConfigState *state) {
+                        const char *name,
+                        struct rewriteConfigState *state) {
     UNUSED(config);
     if (sdslen(server.trace_events) == 0) {
         rewriteConfigMarkAsProcessed(state, name);
