@@ -1,19 +1,19 @@
 #ifdef USE_LTTNG
 
 #undef LTTNG_UST_TRACEPOINT_PROVIDER
-#define LTTNG_UST_TRACEPOINT_PROVIDER valkey_db
+#define LTTNG_UST_TRACEPOINT_PROVIDER valkey_server
 
 #undef LTTNG_UST_TRACEPOINT_INCLUDE
-#define LTTNG_UST_TRACEPOINT_INCLUDE "./trace_db.h"
+#define LTTNG_UST_TRACEPOINT_INCLUDE "./trace_server.h"
 
-#if !defined(__VALKEY_TRACE_DB_H__) || defined(LTTNG_UST_TRACEPOINT_HEADER_MULTI_READ)
-#define __VALKEY_TRACE_DB_H__
+#if !defined(__VALKEY_TRACE_SERVER_H__) || defined(LTTNG_UST_TRACEPOINT_HEADER_MULTI_READ)
+#define __VALKEY_TRACE_SERVER_H__
 
 #include <lttng/tracepoint.h>
 
 LTTNG_UST_TRACEPOINT_EVENT(
 	/* Tracepoint provider name */
-	valkey_db,
+	valkey_server,
 
 	/* Tracepoint name */
 	latency,
@@ -31,25 +31,25 @@ LTTNG_UST_TRACEPOINT_EVENT(
 	)
 )
 
-#define valkey_db_trace(...) lttng_ust_tracepoint(__VA_ARGS__)
+#define valkey_server_trace(...) lttng_ust_tracepoint(__VA_ARGS__)
 
-#endif /* __VALKEY_TRACE_DB_H__ */
+#endif /* __VALKEY_TRACE_SERVER_H__ */
 
 #include <lttng/tracepoint-event.h>
 
 #else /* USE_LTTNG */
 
-#ifndef __VALKEY_TRACE_DB_H__
-#define __VALKEY_TRACE_DB_H__
+#ifndef __VALKEY_TRACE_SERVER_H__
+#define __VALKEY_TRACE_SERVER_H__
 
 /* avoid compiler warning on empty source file */
-static inline void __valkey_db_trace(void) {
+static inline void __valkey_server_trace(void) {
 }
 
-#define valkey_db_trace(...) \
+#define valkey_server_trace(...) \
     do {                     \
     } while (0)
 
-#endif /* __VALKEY_TRACE_DB_H__ */
+#endif /* __VALKEY_TRACE_SERVER_H__ */
 
 #endif /* USE_LTTNG */
