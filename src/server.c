@@ -3743,7 +3743,9 @@ void call(client *c, int flags) {
     else
         duration = ustime() - call_timer;
 
-    valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), c->conn->fmtname, real_cmd->declared_name, duration);
+    if (trace_events.commands) {
+        valkey_commands_trace(valkey_commands, command_call, connGetType(c->conn), c->conn->fmtname, real_cmd->declared_name, duration);
+    }
     c->duration += duration;
     dirty = server.dirty - dirty;
     if (dirty < 0) dirty = 0;
