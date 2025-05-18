@@ -144,8 +144,8 @@ struct connection {
     ConnectionCallbackFunc conn_handler;
     ConnectionCallbackFunc write_handler;
     ConnectionCallbackFunc read_handler;
-    char* saddr;
-    char* daddr;
+    char *saddr;
+    char *daddr;
 };
 
 #define CONFIG_BINDADDR_MAX 16
