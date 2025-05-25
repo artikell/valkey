@@ -17,3 +17,17 @@
 #include "trace.h"
 
 int trace_enabled = 0;
+
+#ifdef USE_LTTNG
+pid_t do_fork(void) {
+    sigset_t sigset;
+    lttng_ust_before_fork(&sigset);
+    int childpid = fork();
+    if (childpid != 0) {
+        lttng_ust_after_fork_parent(&sigset);
+    } else {
+        lttng_ust_after_fork_child(&sigset);
+    }
+    return childpid;
+}
+#endif

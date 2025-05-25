@@ -27,8 +27,13 @@
 extern int trace_enabled;
 
 #ifdef USE_LTTNG
+#include <lttng/ust-fork.h>
+
+pid_t do_fork(void);
+
 #define latencyTraceIfNeeded(type, event, var) \
     if (trace_enabled) valkey_##type##_trace(valkey_##type, event, (var));
+
 #else
 #define latencyTraceIfNeeded(type, event, var) \
     do {                                       \
