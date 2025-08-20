@@ -41,6 +41,7 @@ list(APPEND MODULES_LIST "rdbloadsave")
 list(APPEND MODULES_LIST "crash")
 list(APPEND MODULES_LIST "cluster")
 list(APPEND MODULES_LIST "helloscripting")
+list(APPEND MODULES_LIST "datatiering")
 
 foreach (MODULE_NAME ${MODULES_LIST})
     message(STATUS "Building test module: ${MODULE_NAME}")

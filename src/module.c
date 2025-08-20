@@ -308,6 +308,7 @@ static list *moduleAuthCallbacks;
 
 static pthread_mutex_t moduleUnblockedClientsMutex = PTHREAD_MUTEX_INITIALIZER;
 static list *moduleUnblockedClients;
+static list *moduleDataTieringFilters;
 
 /* Pool for temporary client objects. Creating and destroying a client object is
  * costly. We manage a pool of clients to avoid this cost. Pool expands when
@@ -385,6 +386,17 @@ typedef struct ValkeyModuleCommandFilter {
     /* VALKEYMODULE_CMDFILTER_* flags */
     int flags;
 } ValkeyModuleCommandFilter;
+
+typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleString *key);
+
+typedef struct ValkeyModuleDataTieringFilter {
+    /* The module that registered the filter */
+    ValkeyModule *module;
+    /* Filter callback function */
+    ValkeyModuleDataTieringFilterFunc callback;
+    /* VALKEYMODULE_CMDFILTER_* flags */
+    int flags;
+} ValkeyModuleDataTieringFilter;
 
 /* Registered filters */
 static list *moduleCommandFilters;
@@ -6598,6 +6610,11 @@ ValkeyModuleCallReply *VM_Call(ValkeyModuleCtx *ctx, const char *cmdname, const 
             goto cleanup;
         }
     }
+    
+    if (moduleCallDataTieringFilters(c, TIERING_FETCH_MODULE) != C_OK) {
+        reply = callReplyCreateError(sdsnew("Module attempted to tiered keys."), ctx);
+        goto cleanup;
+    }
 
     if (flags & VALKEYMODULE_ARGV_DRY_RUN) {
         goto cleanup;
@@ -11043,6 +11060,55 @@ unsigned long long VM_CommandFilterGetClientId(ValkeyModuleCommandFilterCtx *fct
     return fctx->c->id;
 }
 
+ValkeyModuleDataTieringFilter *
+VM_RegisterDataTieringFilter(ValkeyModuleCtx *ctx, ValkeyModuleDataTieringFilterFunc callback, int flags) {
+    ValkeyModuleDataTieringFilter *filter = zmalloc(sizeof(*filter));
+    filter->module = ctx->module;
+    filter->callback = callback;
+    filter->flags = flags;
+
+    listAddNodeTail(moduleDataTieringFilters, filter);
+    return filter;
+}
+
+int VM_DataTieringRestore(ValkeyModuleString *key, const char *buf, size_t len) {
+    UNUSED(key);
+    UNUSED(buf);
+    UNUSED(len);
+    return C_OK;
+}
+
+int moduleCallDataTieringFilters(client *c, int flag) {
+    UNUSED(flag);
+    if (listLength(moduleDataTieringFilters) == 0) {
+        return C_OK;
+    }
+    getKeysResult result;
+    initGetKeysResult(&result);
+    getKeysFromCommand(c->cmd, c->argv, c->argc, &result);
+
+    if (!result.numkeys) {
+        getKeysFreeResult(&result);
+        return C_OK;
+    }
+
+    for (int i = 0; i < result.numkeys; i++) {
+        int pos = result.keys[i].pos;
+        robj *obj = dbFind(c->db, c->argv[pos]->ptr);
+        if (obj == NULL) continue;
+        // TODO: how to recognize tiered key
+        if (obj->ptr != NULL)   continue;
+
+        for (listNode *ln = moduleDataTieringFilters->head; ln; ln = ln->next) {
+            serverLog(LL_VERBOSE, "DataTieringFilter callback, key: %s", (char*)((c->argv[result.keys[i].pos])->ptr));
+            // TODO: how to restore value
+            ValkeyModuleDataTieringFilter *filter = ln->value;
+            filter->callback(c->argv[result.keys[i].pos]);
+        }
+    }
+    return C_OK;
+}
+
 /* For a given pointer allocated via ValkeyModule_Alloc() or
  * ValkeyModule_Realloc(), return the amount of memory allocated for it.
  * Note that this may be different (larger) than the memory we allocated
@@ -12100,6 +12166,7 @@ dictType sdsKeyValueHashDictType = {
 
 void moduleInitModulesSystem(void) {
     moduleUnblockedClients = listCreate();
+    moduleDataTieringFilters = listCreate();
     server.loadmodule_queue = listCreate();
     server.module_configs_queue = dictCreate(&sdsKeyValueHashDictType);
     server.module_gil_acquiring = 0;
@@ -14230,4 +14297,6 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(RegisterScriptingEngine);
     REGISTER_API(UnregisterScriptingEngine);
     REGISTER_API(GetFunctionExecutionState);
+    REGISTER_API(RegisterDataTieringFilter);
+    REGISTER_API(DataTieringRestore);
 }

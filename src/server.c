@@ -4463,6 +4463,11 @@ int processCommand(client *c) {
         return C_OK;
     }
 
+    if (moduleCallDataTieringFilters(c, TIERING_FETCH_CLIENT) != C_OK) {
+        rejectCommand(c, shared.loadingerr);
+        return C_OK;
+    }
+
     /* Exec the command */
     if (c->flag.multi && c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != quitCommand &&

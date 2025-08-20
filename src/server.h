@@ -652,6 +652,11 @@ typedef enum {
     CLUSTER_ENDPOINT_TYPE_UNKNOWN_ENDPOINT /* Show NULL or empty */
 } cluster_endpoint_type;
 
+/* Data Tiering flags, see moduleCallDataTieringFilters() function */
+#define TIERING_FETCH_CLIENT 0
+#define TIERING_FETCH_MODULE 1
+#define TIERING_FETCH_SCRIPT 2
+
 /* RDB active child save type. */
 #define RDB_CHILD_TYPE_NONE 0
 #define RDB_CHILD_TYPE_DISK 1   /* RDB is written to disk. */

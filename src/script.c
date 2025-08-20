@@ -571,6 +571,10 @@ void scriptCall(scriptRunCtx *run_ctx, sds *err) {
         /* signify that we already change the data in this execution */
         run_ctx->flags |= SCRIPT_WRITE_DIRTY;
     }
+    if (moduleCallDataTieringFilters(c, TIERING_FETCH_SCRIPT) != C_OK) {
+        *err = sdscatfmt(sdsempty(), "Script attempted to tiered keys.");
+        goto error;
+    }
 
     if (scriptVerifyClusterState(run_ctx, c, run_ctx->original_client, err) != C_OK) {
         goto error;
@@ -583,6 +587,7 @@ void scriptCall(scriptRunCtx *run_ctx, sds *err) {
     if (run_ctx->repl_flags & PROPAGATE_REPL) {
         call_flags |= CMD_CALL_PROPAGATE_REPL;
     }
+
     call(c, call_flags);
     serverAssert(c->flag.blocked == 0);
     clusterSlotStatsInvalidateSlotIfApplicable(run_ctx);

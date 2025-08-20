@@ -206,6 +206,7 @@ void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid)
 unsigned long moduleNotifyKeyspaceSubscribersCnt(void);
 void firePostExecutionUnitJobs(void);
 void moduleCallCommandFilters(client *c);
+int moduleCallDataTieringFilters(client *c, int flag);
 void modulePostExecutionUnitOperations(void);
 void ModuleForkDoneHandler(int exitcode, int bysignal);
 int TerminateModuleForkChild(int child_pid, int wait);

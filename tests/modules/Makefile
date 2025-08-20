@@ -67,6 +67,7 @@ TEST_MODULES = \
     rdbloadsave.so \
     crash.so \
     cluster.so \
+    datatiering.so \
     helloscripting.so
 
 .PHONY: all
