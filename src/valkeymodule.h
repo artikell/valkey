@@ -1107,7 +1107,7 @@ typedef void (*ValkeyModuleClusterMessageReceiver)(ValkeyModuleCtx *ctx,
                                                    uint32_t len);
 typedef void (*ValkeyModuleTimerProc)(ValkeyModuleCtx *ctx, void *data);
 typedef void (*ValkeyModuleCommandFilterFunc)(ValkeyModuleCommandFilterCtx *filter);
-typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleString *key);
+typedef int (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key);
 typedef void (*ValkeyModuleForkDoneHandler)(int exitcode, int bysignal, void *user_data);
 typedef void (*ValkeyModuleScanCB)(ValkeyModuleCtx *ctx,
                                    ValkeyModuleString *keyname,

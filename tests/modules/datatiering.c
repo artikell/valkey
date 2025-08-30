@@ -34,22 +34,34 @@
 #include <string.h>
 #include <stdlib.h>
 
-static void filterCallback(ValkeyModuleString *key) {
-    // ValkeyModule_Log(ctx, "info", "key: %s", ValkeyModule_StringPtrLen(key, NULL));
+static int filterCallback(ValkeyModuleCtx *ctx, ValkeyModuleKey *key) {
+    size_t strlen;
+    const ValkeyModuleString *key_name = ValkeyModule_GetKeyNameFromModuleKey(key);
+    const char *str = ValkeyModule_StringPtrLen(key_name, &strlen);
+    ValkeyModule_Log(ctx, "info", "key: %s, strlen: %ld", str, strlen);
+    ValkeyModuleString *newele = ValkeyModule_CreateStringFromLongLong(ctx, 10010);
+    const char *newele_str = ValkeyModule_StringPtrLen(newele, &strlen);
+    ValkeyModule_Log(ctx, "info", "newele: %s", newele_str);
+    int ret = ValkeyModule_StringSet(key, newele);
+    if (ret != VALKEYMODULE_OK) {
+        ValkeyModule_Log(ctx, "err", "ValkeyModule_StringSet failed");
+    } else {
+        ValkeyModule_Log(ctx, "info", "ValkeyModule_StringSet success");
+    }
+    return 0;
 }
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
     VALKEYMODULE_NOT_USED(argv);
     VALKEYMODULE_NOT_USED(argc);
 
-    if (ValkeyModule_Init(ctx,"test",1,VALKEYMODULE_APIVER_1)
+    if (ValkeyModule_Init(ctx, "data-tiering", 1, VALKEYMODULE_APIVER_1)
         == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
     
-    // ValkeyModuleDataTieringFilter *filter = 
-    ValkeyModule_RegisterDataTieringFilter(ctx, filterCallback, 0);
-    // if (filter == NULL) {
-    //     return VALKEYMODULE_ERR;
-    // }
+    ValkeyModuleDataTieringFilter *filter = ValkeyModule_RegisterDataTieringFilter(ctx, filterCallback, 0);
+    if (filter == NULL) {
+        return VALKEYMODULE_ERR;
+    }
 
     return VALKEYMODULE_OK;
 }

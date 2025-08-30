@@ -387,7 +387,7 @@ typedef struct ValkeyModuleCommandFilter {
     int flags;
 } ValkeyModuleCommandFilter;
 
-typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleString *key);
+typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key);
 
 typedef struct ValkeyModuleDataTieringFilter {
     /* The module that registered the filter */
@@ -4423,6 +4423,7 @@ int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = str;
+    serverLog(LL_NOTICE, "VM_StringSet key: %s, str: %s", key->key->ptr, str->ptr);
     return VALKEYMODULE_OK;
 }
 
@@ -11092,19 +11093,29 @@ int moduleCallDataTieringFilters(client *c, int flag) {
         return C_OK;
     }
 
+    ValkeyModuleCtx ctx;
+    moduleCreateContext(&ctx, NULL, VALKEYMODULE_CTX_COMMAND);
+    ctx.client = c;
+
     for (int i = 0; i < result.numkeys; i++) {
         int pos = result.keys[i].pos;
-        robj *obj = dbFind(c->db, c->argv[pos]->ptr);
-        if (obj == NULL) continue;
+        robj *value = lookupKeyWriteWithFlags(c->db, c->argv[pos], LOOKUP_NOSTATS | LOOKUP_NOEXPIRE);
+        if (value == NULL) continue;
         // TODO: how to recognize tiered key
-        if (obj->ptr != NULL)   continue;
+        // if (obj->ptr != NULL)   continue;
+
+        ValkeyModuleKey vkp = {0};
+        ValkeyModuleKey* kp = &vkp;
+        /* Setup the key handle. */
+        moduleInitKey(kp, &ctx, c->argv[pos], value, VALKEYMODULE_WRITE);
+        autoMemoryAdd(&ctx, VALKEYMODULE_AM_KEY, kp);
 
         for (listNode *ln = moduleDataTieringFilters->head; ln; ln = ln->next) {
-            serverLog(LL_VERBOSE, "DataTieringFilter callback, key: %s", (char*)((c->argv[result.keys[i].pos])->ptr));
-            // TODO: how to restore value
             ValkeyModuleDataTieringFilter *filter = ln->value;
-            filter->callback(c->argv[result.keys[i].pos]);
+            filter->callback(&ctx, kp);
         }
+        moduleCloseKey(kp);
+        autoMemoryFreed(kp->ctx, VALKEYMODULE_AM_KEY, kp);
     }
     return C_OK;
 }
