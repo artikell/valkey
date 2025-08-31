@@ -4423,7 +4423,6 @@ int VM_StringSet(ValkeyModuleKey *key, ValkeyModuleString *str) {
     incrRefCount(str);
     setKey(key->ctx->client, key->db, key->key, &str, SETKEY_NO_SIGNAL | SETKEY_DOESNT_EXIST);
     key->value = str;
-    serverLog(LL_NOTICE, "VM_StringSet key: %s, str: %s", key->key->ptr, str->ptr);
     return VALKEYMODULE_OK;
 }
 
@@ -11101,8 +11100,10 @@ int moduleCallDataTieringFilters(client *c, int flag) {
         int pos = result.keys[i].pos;
         robj *value = lookupKeyWriteWithFlags(c->db, c->argv[pos], LOOKUP_NOSTATS | LOOKUP_NOEXPIRE);
         if (value == NULL) continue;
-        // TODO: how to recognize tiered key
-        // if (obj->ptr != NULL)   continue;
+
+        if (moduleGetMemUsage(c->argv[pos], value, 0, c->db->id) > 0) {
+            continue;
+        }
 
         ValkeyModuleKey vkp = {0};
         ValkeyModuleKey* kp = &vkp;

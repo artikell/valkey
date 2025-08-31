@@ -34,21 +34,75 @@
 #include <string.h>
 #include <stdlib.h>
 
+static ValkeyModuleType *DataTieringType;
+
 static int filterCallback(ValkeyModuleCtx *ctx, ValkeyModuleKey *key) {
-    size_t strlen;
-    const ValkeyModuleString *key_name = ValkeyModule_GetKeyNameFromModuleKey(key);
-    const char *str = ValkeyModule_StringPtrLen(key_name, &strlen);
-    ValkeyModule_Log(ctx, "info", "key: %s, strlen: %ld", str, strlen);
+    int type = ValkeyModule_KeyType(key);
+    if (type != VALKEYMODULE_KEYTYPE_MODULE || ValkeyModule_ModuleTypeGetType(key) != DataTieringType) {
+        return VALKEYMODULE_ERR;
+    }
+
     ValkeyModuleString *newele = ValkeyModule_CreateStringFromLongLong(ctx, 10010);
-    const char *newele_str = ValkeyModule_StringPtrLen(newele, &strlen);
-    ValkeyModule_Log(ctx, "info", "newele: %s", newele_str);
+
     int ret = ValkeyModule_StringSet(key, newele);
     if (ret != VALKEYMODULE_OK) {
         ValkeyModule_Log(ctx, "err", "ValkeyModule_StringSet failed");
     } else {
         ValkeyModule_Log(ctx, "info", "ValkeyModule_StringSet success");
     }
+    return VALKEYMODULE_OK;
+}
+
+void cronLoopCallback(ValkeyModuleCtx *ctx, ValkeyModuleEvent e, uint64_t sub, void *data) {
+    VALKEYMODULE_NOT_USED(e);
+    VALKEYMODULE_NOT_USED(sub);
+    VALKEYMODULE_NOT_USED(data);
+    if (ValkeyModule_DbSize(ctx) <= 0) {
+        return;
+    }
+
+    ValkeyModuleString *key = ValkeyModule_RandomKey(ctx);
+    if (key == NULL) {
+        return;
+    }
+    size_t strlen;
+    const char *key_str = ValkeyModule_StringPtrLen(key, &strlen);
+
+    ValkeyModuleKey *kp = ValkeyModule_OpenKey(ctx, key, VALKEYMODULE_READ | VALKEYMODULE_WRITE);
+    int type = ValkeyModule_KeyType(kp);
+    if (type == VALKEYMODULE_KEYTYPE_MODULE && ValkeyModule_ModuleTypeGetType(kp) == DataTieringType) {
+        return;
+    }
+
+    ValkeyModule_Log(ctx, "info", "cronLoopCallback evict key: %s", key_str);
+
+    ValkeyModule_ModuleTypeSetValue(kp, DataTieringType, NULL);
+    ValkeyModule_CloseKey(kp);
+}
+
+/* ========================== "datatieringtype" type methods ======================= */
+
+void *DataTieringTypeRdbLoad(ValkeyModuleIO *rdb, int encver) {
+    VALKEYMODULE_NOT_USED(rdb);
+    VALKEYMODULE_NOT_USED(encver);
+    ValkeyModule_Assert(0);
+}
+
+void DataTieringTypeRdbSave(ValkeyModuleIO *rdb, void *value) {
+    VALKEYMODULE_NOT_USED(rdb);
+    VALKEYMODULE_NOT_USED(value);
+    ValkeyModule_Assert(0);
+}
+
+size_t DataTieringTypeMemUsage(ValkeyModuleKeyOptCtx *ctx, const void *value, size_t sample_size) {
+    VALKEYMODULE_NOT_USED(ctx);
+    VALKEYMODULE_NOT_USED(value);
+    VALKEYMODULE_NOT_USED(sample_size);
     return 0;
+}
+
+void DataTieringTypeFree(void *value) {
+    VALKEYMODULE_NOT_USED(value);
 }
 
 int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
@@ -57,11 +111,27 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
 
     if (ValkeyModule_Init(ctx, "data-tiering", 1, VALKEYMODULE_APIVER_1)
         == VALKEYMODULE_ERR) return VALKEYMODULE_ERR;
-    
-    ValkeyModuleDataTieringFilter *filter = ValkeyModule_RegisterDataTieringFilter(ctx, filterCallback, 0);
-    if (filter == NULL) {
+
+    ValkeyModuleTypeMethods tm = {
+        .version = VALKEYMODULE_TYPE_METHOD_VERSION,
+        .rdb_load = DataTieringTypeRdbLoad,
+        .rdb_save = DataTieringTypeRdbSave,
+        .mem_usage2 = DataTieringTypeMemUsage,
+        .free = DataTieringTypeFree,
+    };
+
+    DataTieringType = ValkeyModule_CreateDataType(ctx, "datatier-", 0, &tm);
+    if (DataTieringType == NULL) {
+        ValkeyModule_Log(ctx, "err", "ValkeyModule CreateDataType failed");
         return VALKEYMODULE_ERR;
     }
 
+    ValkeyModuleDataTieringFilter *filter = ValkeyModule_RegisterDataTieringFilter(ctx, filterCallback, 0);
+    if (filter == NULL) {
+        ValkeyModule_Log(ctx, "err", "ValkeyModule RegisterDataTieringFilter failed");
+        return VALKEYMODULE_ERR;
+    }
+
+    ValkeyModule_SubscribeToServerEvent(ctx, ValkeyModuleEvent_CronLoop, cronLoopCallback);
     return VALKEYMODULE_OK;
 }
