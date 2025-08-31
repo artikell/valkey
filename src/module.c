@@ -387,7 +387,7 @@ typedef struct ValkeyModuleCommandFilter {
     int flags;
 } ValkeyModuleCommandFilter;
 
-typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key);
+typedef void (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key, int flags);
 
 typedef struct ValkeyModuleDataTieringFilter {
     /* The module that registered the filter */
@@ -11071,15 +11071,38 @@ VM_RegisterDataTieringFilter(ValkeyModuleCtx *ctx, ValkeyModuleDataTieringFilter
     return filter;
 }
 
-int VM_DataTieringRestore(ValkeyModuleString *key, const char *buf, size_t len) {
-    UNUSED(key);
-    UNUSED(buf);
-    UNUSED(len);
+int moduleDataTieringFetchValue(robj *key, client *c, int flags) {
+    robj *value = lookupKeyWriteWithFlags(c->db, key, LOOKUP_NOSTATS | LOOKUP_NOEXPIRE);
+    if (value == NULL) {
+        return C_OK;
+    }
+
+    if (moduleGetMemUsage(key, value, 0, c->db->id) > 0) {
+        return C_OK;
+    }
+
+    ValkeyModuleCtx ctx;
+    moduleCreateContext(&ctx, NULL, VALKEYMODULE_CTX_COMMAND);
+    ctx.client = c;
+
+    ValkeyModuleKey vkp = {0};
+    ValkeyModuleKey* kp = &vkp;
+
+    /* Setup the key handle. */
+    moduleInitKey(kp, &ctx, key, value, VALKEYMODULE_WRITE);
+    autoMemoryAdd(&ctx, VALKEYMODULE_AM_KEY, kp);
+
+    for (listNode *ln = moduleDataTieringFilters->head; ln; ln = ln->next) {
+        ValkeyModuleDataTieringFilter *filter = ln->value;
+        filter->callback(&ctx, kp, flags);
+    }
+
+    moduleCloseKey(kp);
+    autoMemoryFreed(kp->ctx, VALKEYMODULE_AM_KEY, kp);
     return C_OK;
 }
 
-int moduleCallDataTieringFilters(client *c, int flag) {
-    UNUSED(flag);
+int moduleCallDataTieringFilters(client *c, int flags) {
     if (listLength(moduleDataTieringFilters) == 0) {
         return C_OK;
     }
@@ -11092,31 +11115,9 @@ int moduleCallDataTieringFilters(client *c, int flag) {
         return C_OK;
     }
 
-    ValkeyModuleCtx ctx;
-    moduleCreateContext(&ctx, NULL, VALKEYMODULE_CTX_COMMAND);
-    ctx.client = c;
-
     for (int i = 0; i < result.numkeys; i++) {
         int pos = result.keys[i].pos;
-        robj *value = lookupKeyWriteWithFlags(c->db, c->argv[pos], LOOKUP_NOSTATS | LOOKUP_NOEXPIRE);
-        if (value == NULL) continue;
-
-        if (moduleGetMemUsage(c->argv[pos], value, 0, c->db->id) > 0) {
-            continue;
-        }
-
-        ValkeyModuleKey vkp = {0};
-        ValkeyModuleKey* kp = &vkp;
-        /* Setup the key handle. */
-        moduleInitKey(kp, &ctx, c->argv[pos], value, VALKEYMODULE_WRITE);
-        autoMemoryAdd(&ctx, VALKEYMODULE_AM_KEY, kp);
-
-        for (listNode *ln = moduleDataTieringFilters->head; ln; ln = ln->next) {
-            ValkeyModuleDataTieringFilter *filter = ln->value;
-            filter->callback(&ctx, kp);
-        }
-        moduleCloseKey(kp);
-        autoMemoryFreed(kp->ctx, VALKEYMODULE_AM_KEY, kp);
+        moduleDataTieringFetchValue(c->argv[pos], c, flags);
     }
     return C_OK;
 }
@@ -14310,5 +14311,4 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(UnregisterScriptingEngine);
     REGISTER_API(GetFunctionExecutionState);
     REGISTER_API(RegisterDataTieringFilter);
-    REGISTER_API(DataTieringRestore);
 }

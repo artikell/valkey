@@ -653,9 +653,9 @@ typedef enum {
 } cluster_endpoint_type;
 
 /* Data Tiering flags, see moduleCallDataTieringFilters() function */
-#define TIERING_FETCH_CLIENT 0
-#define TIERING_FETCH_MODULE 1
-#define TIERING_FETCH_SCRIPT 2
+#define TIERING_FETCH_CLIENT (VALKEYMODULE_FETCH_NONE | VALKEYMODULE_FETCH_ASYNC)
+#define TIERING_FETCH_MODULE (VALKEYMODULE_FETCH_NONE)
+#define TIERING_FETCH_SCRIPT (VALKEYMODULE_FETCH_NONE)
 
 /* RDB active child save type. */
 #define RDB_CHILD_TYPE_NONE 0

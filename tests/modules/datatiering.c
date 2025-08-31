@@ -36,7 +36,8 @@
 
 static ValkeyModuleType *DataTieringType;
 
-static int filterCallback(ValkeyModuleCtx *ctx, ValkeyModuleKey *key) {
+static int filterCallback(ValkeyModuleCtx *ctx, ValkeyModuleKey *key, int flags) {
+    VALKEYMODULE_NOT_USED(flags);
     int type = ValkeyModule_KeyType(key);
     if (type != VALKEYMODULE_KEYTYPE_MODULE || ValkeyModule_ModuleTypeGetType(key) != DataTieringType) {
         return VALKEYMODULE_ERR;

@@ -335,6 +335,11 @@ typedef uint64_t ValkeyModuleTimerID;
  * Use ValkeyModule_GetModuleOptionsAll instead. */
 #define _VALKEYMODULE_OPTIONS_FLAGS_NEXT (1 << 5)
 
+/* DataTiering Fetch Flags */
+#define VALKEYMODULE_FETCH_NONE (1 << 0)
+
+#define VALKEYMODULE_FETCH_ASYNC (1 << 0)
+
 /* Definitions for ValkeyModule_SetCommandInfo. */
 
 typedef enum {
@@ -1107,7 +1112,7 @@ typedef void (*ValkeyModuleClusterMessageReceiver)(ValkeyModuleCtx *ctx,
                                                    uint32_t len);
 typedef void (*ValkeyModuleTimerProc)(ValkeyModuleCtx *ctx, void *data);
 typedef void (*ValkeyModuleCommandFilterFunc)(ValkeyModuleCommandFilterCtx *filter);
-typedef int (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key);
+typedef int (*ValkeyModuleDataTieringFilterFunc)(ValkeyModuleCtx *ctx, ValkeyModuleKey *key, int flags);
 typedef void (*ValkeyModuleForkDoneHandler)(int exitcode, int bysignal, void *user_data);
 typedef void (*ValkeyModuleScanCB)(ValkeyModuleCtx *ctx,
                                    ValkeyModuleString *keyname,
@@ -1745,7 +1750,6 @@ VALKEYMODULE_API int (*ValkeyModule_ExportSharedAPI)(ValkeyModuleCtx *ctx,
 VALKEYMODULE_API void *(*ValkeyModule_GetSharedAPI)(ValkeyModuleCtx *ctx, const char *apiname)VALKEYMODULE_ATTR;
 VALKEYMODULE_API ValkeyModuleDataTieringFilter *(*ValkeyModule_RegisterDataTieringFilter)(ValkeyModuleCtx *ctx, 
                                     ValkeyModuleDataTieringFilterFunc callback, int flags)VALKEYMODULE_ATTR;
-VALKEYMODULE_API int (*ValkeyModule_DataTieringRestore)(ValkeyModuleString *key, const char *buf, size_t len)VALKEYMODULE_ATTR;
 VALKEYMODULE_API ValkeyModuleCommandFilter *(*ValkeyModule_RegisterCommandFilter)(ValkeyModuleCtx *ctx,
                                                                                   ValkeyModuleCommandFilterFunc cb,
                                                                                   int flags)VALKEYMODULE_ATTR;
@@ -2275,7 +2279,6 @@ static int ValkeyModule_Init(ValkeyModuleCtx *ctx, const char *name, int ver, in
     VALKEYMODULE_GET_API(UnregisterScriptingEngine);
     VALKEYMODULE_GET_API(GetFunctionExecutionState);
     VALKEYMODULE_GET_API(RegisterDataTieringFilter);
-    VALKEYMODULE_GET_API(DataTieringRestore);
 
     if (ValkeyModule_IsModuleNameBusy && ValkeyModule_IsModuleNameBusy(name)) return VALKEYMODULE_ERR;
     ValkeyModule_SetModuleAttribs(ctx, name, ver, apiver);

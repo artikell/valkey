@@ -1401,6 +1401,9 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, long *key_counter) {
 
         initStaticStringObject(key, keystr);
         expire = objectGetExpire(o);
+
+        moduleDataTieringFetchValue(&key, NULL, VALKEYMODULE_FETCH_NONE);
+
         if ((res = rdbSaveKeyValuePair(rdb, &key, o, expire, dbid)) < 0) goto werr;
         written += res;
 
