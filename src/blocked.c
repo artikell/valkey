@@ -61,10 +61,7 @@
  */
 
 #include "server.h"
-#include "slowlog.h"
-#include "latency.h"
 #include "monotonic.h"
-#include "cluster_slot_stats.h"
 
 /* forward declarations */
 static void unblockClientWaitingData(client *c);
@@ -109,18 +106,12 @@ void blockClient(client *c, int btype) {
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_errors) {
     const ustime_t total_cmd_duration = c->duration + blocked_us + reply_us;
     c->lastcmd->microseconds += total_cmd_duration;
-    clusterSlotStatsAddCpuDuration(c, total_cmd_duration);
     c->lastcmd->calls++;
     c->commands_processed++;
     server.stat_numcommands++;
     if (had_errors) c->lastcmd->failed_calls++;
-    if (server.latency_tracking_enabled)
-        updateCommandLatencyHistogram(&(c->lastcmd->latency_histogram), total_cmd_duration * 1000);
     /* Log the command into the Slow log if needed. */
-    slowlogPushCurrentCommand(c, c->lastcmd, total_cmd_duration);
     c->duration = 0;
-    /* Log the reply duration event. */
-    latencyAddSampleIfNeeded("command-unblocking", reply_us / 1000);
 }
 
 /* This function is called in the beforeSleep() function of the event loop
@@ -188,8 +179,6 @@ void queueClientForReprocessing(client *c) {
 void unblockClient(client *c, int queue_for_reprocessing) {
     if (c->bstate.btype == BLOCKED_LIST || c->bstate.btype == BLOCKED_ZSET || c->bstate.btype == BLOCKED_STREAM) {
         unblockClientWaitingData(c);
-    } else if (c->bstate.btype == BLOCKED_WAIT) {
-        unblockClientWaitingReplicas(c);
     } else if (c->bstate.btype == BLOCKED_MODULE) {
         if (moduleClientIsBlockedOnKeys(c)) unblockClientWaitingData(c);
         unblockClientFromModule(c);
@@ -211,7 +200,6 @@ void unblockClient(client *c, int queue_for_reprocessing) {
          * call reqresAppendResponse here (for clients blocked on key,
          * unblockClientOnKey is called, which eventually calls processCommand,
          * which calls reqresAppendResponse) */
-        reqresAppendResponse(c);
         resetClient(c);
     }
 
@@ -248,18 +236,6 @@ void replyToBlockedClientTimedOut(client *c) {
     if (c->bstate.btype == BLOCKED_LIST || c->bstate.btype == BLOCKED_ZSET || c->bstate.btype == BLOCKED_STREAM) {
         addReplyNullArray(c);
         updateStatsOnUnblock(c, 0, 0, 0);
-    } else if (c->bstate.btype == BLOCKED_WAIT) {
-        if (c->cmd->proc == waitCommand) {
-            addReplyLongLong(c, replicationCountAcksByOffset(c->bstate.reploffset));
-        } else if (c->cmd->proc == waitaofCommand) {
-            addReplyArrayLen(c, 2);
-            addReplyLongLong(c, server.fsynced_reploff >= c->bstate.reploffset);
-            addReplyLongLong(c, replicationCountAOFAcksByOffset(c->bstate.reploffset));
-        } else if (c->cmd->proc == clusterCommand) {
-            addReplyErrorObject(c, shared.noreplicaserr);
-        } else {
-            serverPanic("Unknown wait command %s in replyToBlockedClientTimedOut().", c->cmd->declared_name);
-        }
     } else if (c->bstate.btype == BLOCKED_MODULE) {
         moduleBlockedClientTimedOut(c, 0);
     } else {
@@ -606,21 +582,6 @@ static void handleClientsBlockedOnKey(readyList *rl) {
     }
 }
 
-/* block a client for replica acknowledgement */
-void blockClientForReplicaAck(client *c, mstime_t timeout, long long offset, long numreplicas, int numlocal) {
-    c->bstate.timeout = timeout;
-    c->bstate.reploffset = offset;
-    c->bstate.numreplicas = numreplicas;
-    c->bstate.numlocal = numlocal;
-    listAddNodeHead(server.clients_waiting_acks, c);
-    /* Note that we remember the linked list node where the client is stored,
-     * this way removing the client in unblockClientWaitingReplicas() will not
-     * require a linear scan, but just a constant time operation. */
-    serverAssert(c->bstate.client_waiting_acks_list_node == NULL);
-    c->bstate.client_waiting_acks_list_node = listFirst(server.clients_waiting_acks);
-    blockClient(c, BLOCKED_WAIT);
-}
-
 /* Postpone client from executing a command. For example the server might be busy
  * requesting to avoid processing clients commands which will be processed later
  * when the it is ready to accept them. */
@@ -736,11 +697,6 @@ void unblockClientOnError(client *c, const char *err_str) {
 void blockedBeforeSleep(void) {
     /* Handle precise timeouts of blocked clients. */
     handleBlockedClientsTimeout();
-
-    /* Unblock all the clients blocked for synchronous replication
-     * in WAIT or WAITAOF. */
-    if (listLength(server.clients_waiting_acks)) processClientsWaitingReplicas();
-
     /* Try to process blocked clients every once in while.
      *
      * Example: A module calls RM_SignalKeyAsReady from within a timer callback

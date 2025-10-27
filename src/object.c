@@ -398,182 +398,6 @@ void decrRefCount(robj *o) {
     }
 }
 
-/* See dismissObject() */
-void dismissSds(sds s) {
-    dismissMemory(sdsAllocPtr(s), sdsAllocSize(s));
-}
-
-/* See dismissObject() */
-void dismissStringObject(robj *o) {
-    if (o->encoding == OBJ_ENCODING_RAW) {
-        dismissSds(o->ptr);
-    }
-}
-
-/* See dismissObject() */
-void dismissListObject(robj *o, size_t size_hint) {
-    if (o->encoding == OBJ_ENCODING_QUICKLIST) {
-        quicklist *ql = o->ptr;
-        serverAssert(ql->len != 0);
-        /* We iterate all nodes only when average node size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / ql->len >= server.page_size) {
-            quicklistNode *node = ql->head;
-            while (node) {
-                if (quicklistNodeIsCompressed(node)) {
-                    dismissMemory(node->entry, ((quicklistLZF *)node->entry)->sz);
-                } else {
-                    dismissMemory(node->entry, node->sz);
-                }
-                node = node->next;
-            }
-        }
-    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        dismissMemory(o->ptr, lpBytes((unsigned char *)o->ptr));
-    } else {
-        serverPanic("Unknown list encoding type");
-    }
-}
-
-/* See dismissObject() */
-void dismissSetObject(robj *o, size_t size_hint) {
-    if (o->encoding == OBJ_ENCODING_HT) {
-        dict *set = o->ptr;
-        serverAssert(dictSize(set) != 0);
-        /* We iterate all nodes only when average member size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / dictSize(set) >= server.page_size) {
-            dictEntry *de;
-            dictIterator *di = dictGetIterator(set);
-            while ((de = dictNext(di)) != NULL) {
-                dismissSds(dictGetKey(de));
-            }
-            dictReleaseIterator(di);
-        }
-
-        /* Dismiss hash table memory. */
-        dismissMemory(set->ht_table[0], DICTHT_SIZE(set->ht_size_exp[0]) * sizeof(dictEntry *));
-        dismissMemory(set->ht_table[1], DICTHT_SIZE(set->ht_size_exp[1]) * sizeof(dictEntry *));
-    } else if (o->encoding == OBJ_ENCODING_INTSET) {
-        dismissMemory(o->ptr, intsetBlobLen((intset *)o->ptr));
-    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        dismissMemory(o->ptr, lpBytes((unsigned char *)o->ptr));
-    } else {
-        serverPanic("Unknown set encoding type");
-    }
-}
-
-/* See dismissObject() */
-void dismissZsetObject(robj *o, size_t size_hint) {
-    if (o->encoding == OBJ_ENCODING_SKIPLIST) {
-        zset *zs = o->ptr;
-        zskiplist *zsl = zs->zsl;
-        serverAssert(zsl->length != 0);
-        /* We iterate all nodes only when average member size is bigger than a
-         * page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / zsl->length >= server.page_size) {
-            zskiplistNode *zn = zsl->tail;
-            while (zn != NULL) {
-                dismissSds(zn->ele);
-                zn = zn->backward;
-            }
-        }
-
-        /* Dismiss hash table memory. */
-        dict *d = zs->dict;
-        dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * sizeof(dictEntry *));
-        dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * sizeof(dictEntry *));
-    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        dismissMemory(o->ptr, lpBytes((unsigned char *)o->ptr));
-    } else {
-        serverPanic("Unknown zset encoding type");
-    }
-}
-
-/* See dismissObject() */
-void dismissHashObject(robj *o, size_t size_hint) {
-    if (o->encoding == OBJ_ENCODING_HT) {
-        dict *d = o->ptr;
-        serverAssert(dictSize(d) != 0);
-        /* We iterate all fields only when average field/value size is bigger than
-         * a page size, and there's a high chance we'll actually dismiss something. */
-        if (size_hint / dictSize(d) >= server.page_size) {
-            dictEntry *de;
-            dictIterator *di = dictGetIterator(d);
-            while ((de = dictNext(di)) != NULL) {
-                /* Only dismiss values memory since the field size
-                 * usually is small. */
-                dismissSds(dictGetVal(de));
-            }
-            dictReleaseIterator(di);
-        }
-
-        /* Dismiss hash table memory. */
-        dismissMemory(d->ht_table[0], DICTHT_SIZE(d->ht_size_exp[0]) * sizeof(dictEntry *));
-        dismissMemory(d->ht_table[1], DICTHT_SIZE(d->ht_size_exp[1]) * sizeof(dictEntry *));
-    } else if (o->encoding == OBJ_ENCODING_LISTPACK) {
-        dismissMemory(o->ptr, lpBytes((unsigned char *)o->ptr));
-    } else {
-        serverPanic("Unknown hash encoding type");
-    }
-}
-
-/* See dismissObject() */
-void dismissStreamObject(robj *o, size_t size_hint) {
-    stream *s = o->ptr;
-    rax *rax = s->rax;
-    if (raxSize(rax) == 0) return;
-
-    /* Iterate only on stream entries, although size_hint may include serialized
-     * consumer groups info, but usually, stream entries take up most of
-     * the space. */
-    if (size_hint / raxSize(rax) >= server.page_size) {
-        raxIterator ri;
-        raxStart(&ri, rax);
-        raxSeek(&ri, "^", NULL, 0);
-        while (raxNext(&ri)) {
-            dismissMemory(ri.data, lpBytes(ri.data));
-        }
-        raxStop(&ri);
-    }
-}
-
-/* When creating a snapshot in a fork child process, the main process and child
- * process share the same physical memory pages, and if / when the parent
- * modifies any keys due to write traffic, it'll cause CoW which consume
- * physical memory. In the child process, after serializing the key and value,
- * the data is definitely not accessed again, so to avoid unnecessary CoW, we
- * try to release their memory back to OS. see dismissMemory().
- *
- * Because of the cost of iterating all node/field/member/entry of complex data
- * types, we iterate and dismiss them only when approximate average we estimate
- * the size of an individual allocation is more than a page size of OS.
- * 'size_hint' is the size of serialized value. This method is not accurate, but
- * it can reduce unnecessary iteration for complex data types that are probably
- * not going to release any memory. */
-void dismissObject(robj *o, size_t size_hint) {
-    /* madvise(MADV_DONTNEED) may not work if Transparent Huge Pages is enabled. */
-    if (server.thp_enabled) return;
-
-        /* Currently we use zmadvise_dontneed only when we use jemalloc with Linux.
-         * so we avoid these pointless loops when they're not going to do anything. */
-#if defined(USE_JEMALLOC) && defined(__linux__)
-    if (o->refcount != 1) return;
-    switch (o->type) {
-    case OBJ_STRING: dismissStringObject(o); break;
-    case OBJ_LIST: dismissListObject(o, size_hint); break;
-    case OBJ_SET: dismissSetObject(o, size_hint); break;
-    case OBJ_ZSET: dismissZsetObject(o, size_hint); break;
-    case OBJ_HASH: dismissHashObject(o, size_hint); break;
-    case OBJ_STREAM: dismissStreamObject(o, size_hint); break;
-    default: break;
-    }
-#else
-    UNUSED(o);
-    UNUSED(size_hint);
-#endif
-}
-
 /* This variant of decrRefCount() gets its argument as void, and is useful
  * as free method in data structures that expect a 'void free_object(void*)'
  * prototype for the free method. */
@@ -1180,22 +1004,9 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
 
     mem_total += server.initial_memory_usage;
 
-    /* Replication backlog and replicas share one global replication buffer,
-     * only if replication buffer memory is more than the repl backlog setting,
-     * we consider the excess as replicas' memory. Otherwise, replication buffer
-     * memory is the consumption of repl backlog. */
-    if (listLength(server.replicas) && (long long)server.repl_buffer_mem > server.repl_backlog_size) {
-        mh->clients_replicas = server.repl_buffer_mem - server.repl_backlog_size;
-        mh->repl_backlog = server.repl_backlog_size;
-    } else {
-        mh->clients_replicas = 0;
-        mh->repl_backlog = server.repl_buffer_mem;
-    }
-    if (server.repl_backlog) {
-        /* The approximate memory of rax tree for indexed blocks. */
-        mh->repl_backlog += server.repl_backlog->blocks_index->numnodes * sizeof(raxNode) +
-                            raxSize(server.repl_backlog->blocks_index) * sizeof(void *);
-    }
+
+    mh->clients_replicas = 0;
+    mh->repl_backlog = 0;
     mem_total += mh->repl_backlog;
     mem_total += mh->clients_replicas;
 
@@ -1211,9 +1022,6 @@ struct serverMemOverhead *getMemoryOverheadData(void) {
     mem_total += mh->cluster_links;
 
     mem = 0;
-    if (server.aof_state != AOF_OFF) {
-        mem += sdsAllocSize(server.aof_buf);
-    }
     mh->aof_buffer = mem;
     mem_total += mem;
 

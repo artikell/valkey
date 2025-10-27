@@ -28,13 +28,10 @@
  */
 
 #include "server.h"
-#include "cluster.h"
-#include "cluster_slot_stats.h"
 #include "script.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
 #include "fmtargs.h"
-#include "io_threads.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -44,10 +41,7 @@
 
 static void setProtocolError(const char *errstr, client *c);
 static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
-int postponeClientRead(client *c);
-char *getClientSockname(client *c);
 
-int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 __thread sds thread_shared_qb = NULL;
 
 typedef enum { PARSE_OK = 0, PARSE_ERR = -1, PARSE_NEEDMORE = -2 } parseResult;
@@ -97,14 +91,6 @@ void linkClient(client *c) {
     raxInsert(server.clients_index, (unsigned char *)&id, sizeof(id), c, NULL);
 }
 
-/* Initialize client authentication state. */
-static void clientSetDefaultAuth(client *c) {
-    /* If the default user does not require authentication, the user is
-     * directly authenticated. */
-    clientSetUser(c, DefaultUser,
-                  (DefaultUser->flags & USER_FLAG_NOPASS) && !(DefaultUser->flags & USER_FLAG_DISABLED));
-}
-
 /* Attach the user u to this client.
  * Also, mark the client authentication state. In case the client is marked as authenticated,
  * it will also set the ever_authenticated flag on the client in order to avoid low level
@@ -113,18 +99,6 @@ void clientSetUser(client *c, user *u, int authenticated) {
     c->user = u;
     c->flag.authenticated = authenticated;
     if (authenticated) c->flag.ever_authenticated = authenticated;
-}
-
-static int clientEverAuthenticated(client *c) {
-    return c->flag.ever_authenticated;
-}
-
-int authRequired(client *c) {
-    /* Check if the user is authenticated. This check is skipped in case
-     * the default user is flagged as "nopass" and is active. */
-    int auth_required = (!(DefaultUser->flags & USER_FLAG_NOPASS) || (DefaultUser->flags & USER_FLAG_DISABLED)) &&
-                        !c->flag.authenticated;
-    return auth_required;
 }
 
 static inline int isReplicaReadyForReplData(client *replica) {
@@ -140,21 +114,13 @@ client *createClient(connection *conn) {
      * in the context of a client. When commands are executed in other
      * contexts (for instance a Lua script) we need a non connected client. */
     if (conn) {
-        connEnableTcpNoDelay(conn);
-        if (server.tcpkeepalive) connKeepAlive(conn, server.tcpkeepalive);
-        connSetReadHandler(conn, readQueryFromClient);
         connSetPrivateData(conn, c);
     }
     c->buf = zmalloc_usable(PROTO_REPLY_CHUNK_BYTES, &c->buf_usable_size);
     selectDb(c, 0);
     uint64_t client_id = atomic_fetch_add_explicit(&server.next_client_id, 1, memory_order_relaxed);
     c->id = client_id;
-#ifdef LOG_REQ_RES
-    reqresReset(c, 0);
-    c->resp = server.client_default_resp;
-#else
     c->resp = 2;
-#endif
     c->conn = conn;
     c->name = NULL;
     c->lib_name = NULL;
@@ -187,13 +153,11 @@ client *createClient(connection *conn) {
     c->slot = -1;
     c->ctime = c->last_interaction = server.unixtime;
     c->duration = 0;
-    clientSetDefaultAuth(c);
     c->repl_state = REPL_STATE_NONE;
     c->repl_start_cmd_stream_on_ack = 0;
     c->reploff = 0;
     c->read_reploff = 0;
     c->repl_applied = 0;
-    c->repl_ack_off = 0;
     c->repl_ack_time = 0;
     c->repl_aof_off = 0;
     c->repl_last_partial_write = 0;
@@ -247,14 +211,7 @@ client *createClient(connection *conn) {
 
 void installClientWriteHandler(client *c) {
     int ae_barrier = 0;
-    /* For the fsync=always policy, we want that a given FD is never
-     * served for reading and writing in the same event loop iteration,
-     * so that in the middle of receiving the query, and serving it
-     * to the client, we'll call beforeSleep() that will do the
-     * actual fsync of AOF to disk. the write barrier ensures that. */
-    if (server.aof_state == AOF_ON && server.aof_fsync == AOF_FSYNC_ALWAYS) {
-        ae_barrier = 1;
-    }
+
     if (connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_barrier) == C_ERR) {
         freeClientAsync(c);
     }
@@ -456,22 +413,7 @@ int cmdHasPushAsReply(struct serverCommand *cmd) {
 void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     if (c->flag.close_after_reply) return;
 
-    /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
-     * replication link that caused a reply to be generated we'll simply disconnect it.
-     * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
-        logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
-                                        cmdname ? cmdname : "<unknown>");
-        return;
-    }
-
     c->net_output_bytes_curr_cmd += len;
-
-    /* We call it here because this function may affect the reply
-     * buffer offset (see function comment) */
-    reqresSaveClientReplyOffset(c);
 
     /* If we're processing a push message into the current client (i.e. executing PUBLISH
      * to a channel which we are subscribed to, then we wanna postpone that message to be added
@@ -602,56 +544,6 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
          * to be counted as failed so we update it here. We update c->realcmd in
          * case c->cmd was changed (like in GEOADD). */
         c->realcmd->failed_calls++;
-    }
-
-    /* Sometimes it could be normal that a replica replies to a primary with
-     * an error and this function gets called. Actually the error will never
-     * be sent because addReply*() against primary clients has no effect...
-     *
-     * It can happen when the versions are different and replica cannot recognize
-     * the commands sent by the primary. However it is useful to log such events since
-     * they are rare and may hint at errors in a script or a bug in the server. */
-    int ctype = getClientType(c);
-    if (ctype == CLIENT_TYPE_PRIMARY || ctype == CLIENT_TYPE_REPLICA || c->id == CLIENT_ID_AOF) {
-        char *to, *from;
-
-        if (c->id == CLIENT_ID_AOF) {
-            to = "AOF-loading-client";
-            from = "server";
-        } else if (ctype == CLIENT_TYPE_PRIMARY) {
-            to = "primary";
-            from = "replica";
-        } else {
-            to = "replica";
-            from = "primary";
-        }
-
-        if (len > 4096) len = 4096;
-        sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
-        serverLog(LL_WARNING,
-                  "== CRITICAL == This %s is sending an error "
-                  "to its %s: '%.*s' after processing the command "
-                  "'%s'",
-                  from, to, (int)len, s, cmdname ? cmdname : "<unknown>");
-        if (ctype == CLIENT_TYPE_PRIMARY && server.repl_backlog && server.repl_backlog->histlen > 0) {
-            showLatestBacklog();
-        }
-        server.stat_unexpected_error_replies++;
-
-        /* Based off the propagation error behavior, check if we need to panic here. There
-         * are currently two checked cases:
-         * * If this command was from our primary and we are not a writable replica.
-         * * We are reading from an AOF file. */
-        int panic_in_replicas = (ctype == CLIENT_TYPE_PRIMARY && server.repl_replica_ro) &&
-                                (server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC ||
-                                 server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS);
-        int panic_in_aof =
-            c->id == CLIENT_ID_AOF && server.propagation_error_behavior == PROPAGATION_ERR_BEHAVIOR_PANIC;
-        if (panic_in_replicas || panic_in_aof) {
-            serverPanic("This %s panicked sending an error to its %s"
-                        " after processing the command '%s'",
-                        from, to, cmdname ? cmdname : "<unknown>");
-        }
     }
 }
 
@@ -800,21 +692,6 @@ void *addReplyDeferredLen(client *c) {
      * ready to be sent, since we are sure that before returning to the
      * event loop setDeferredAggregateLen() will be called. */
     if (prepareClientToWrite(c) != C_OK) return NULL;
-
-    /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
-     * replication link that caused a reply to be generated we'll simply disconnect it.
-     * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
-        logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
-                                        cmdname ? cmdname : "<unknown>");
-        return NULL;
-    }
-
-    /* We call it here because this function conceptually affects the reply
-     * buffer offset (see function comment) */
-    reqresSaveClientReplyOffset(c);
 
     trimReplyUnusedTailSpace(c);
     listAddNodeTail(c->reply, NULL); /* NULL is our placeholder. */
@@ -1322,155 +1199,22 @@ void deferredAfterErrorReply(client *c, list *errors) {
     }
 }
 
-/* Logically copy 'src' replica client buffers info to 'dst' replica.
- * Basically increase referenced buffer block node reference count. */
-void copyReplicaOutputBuffer(client *dst, client *src) {
-    serverAssert(src->bufpos == 0 && listLength(src->reply) == 0);
-
-    if (src->ref_repl_buf_node == NULL) return;
-    dst->ref_repl_buf_node = src->ref_repl_buf_node;
-    dst->ref_block_pos = src->ref_block_pos;
-    ((replBufBlock *)listNodeValue(dst->ref_repl_buf_node))->refcount++;
-}
-
 /* Return true if the specified client has pending reply buffers to write to
  * the socket. */
 int clientHasPendingReplies(client *c) {
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        /* Replicas use global shared replication buffer instead of
-         * private output buffer. */
-        serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
-        if (c->ref_repl_buf_node == NULL) return 0;
-
-        /* If the last replication buffer block content is totally sent,
-         * we have nothing to send. */
-        listNode *ln = listLast(server.repl_buffer_blocks);
-        replBufBlock *tail = listNodeValue(ln);
-        if (ln == c->ref_repl_buf_node && c->ref_block_pos == tail->used) return 0;
-
-        return 1;
-    } else {
-        return c->bufpos || listLength(c->reply);
-    }
+    return c->bufpos || listLength(c->reply);
 }
 
 void clientAcceptHandler(connection *conn) {
     client *c = connGetPrivateData(conn);
 
     if (connGetState(conn) != CONN_STATE_CONNECTED) {
-        serverLog(LL_WARNING, "Error accepting a client connection: %s (addr=%s laddr=%s)", connGetLastError(conn),
-                  getClientPeerId(c), getClientSockname(c));
         freeClientAsync(c);
         return;
     }
 
-    /* If the server is running in protected mode (the default) and there
-     * is no password set, nor a specific interface is bound, we don't accept
-     * requests from non loopback interfaces. Instead we try to explain the
-     * user what to do to fix it if needed. */
-    if (server.protected_mode && DefaultUser->flags & USER_FLAG_NOPASS) {
-        if (connIsLocal(conn) != 1) {
-            char *err = "-DENIED Running in protected mode because protected "
-                        "mode is enabled and no password is set for the default user. "
-                        "In this mode connections are only accepted from the loopback interface. "
-                        "If you want to connect from external computers, you "
-                        "may adopt one of the following solutions: "
-                        "1) Just disable protected mode sending the command "
-                        "'CONFIG SET protected-mode no' from the loopback interface "
-                        "by connecting from the same host the server is "
-                        "running, however MAKE SURE it's not publicly accessible "
-                        "from internet if you do so. Use CONFIG REWRITE to make this "
-                        "change permanent. "
-                        "2) Alternatively you can just disable the protected mode by "
-                        "editing the configuration file, and setting the protected "
-                        "mode option to 'no', and then restarting the server. "
-                        "3) If you started the server manually just for testing, restart "
-                        "it with the '--protected-mode no' option. "
-                        "4) Set up an authentication password for the default user. "
-                        "NOTE: You only need to do one of the above things in order for "
-                        "the server to start accepting connections from the outside.\r\n";
-            if (connWrite(c->conn, err, strlen(err)) == -1) {
-                /* Nothing to do, Just to avoid the warning... */
-            }
-            server.stat_rejected_conn++;
-            freeClientAsync(c);
-            return;
-        }
-    }
-
     server.stat_numconnections++;
     moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_CONNECTED, c);
-}
-
-void acceptCommonHandler(connection *conn, struct ClientFlags flags, char *ip) {
-    client *c;
-    UNUSED(ip);
-
-    if (connGetState(conn) != CONN_STATE_ACCEPTING) {
-        char addr[NET_ADDR_STR_LEN] = {0};
-        char laddr[NET_ADDR_STR_LEN] = {0};
-        connFormatAddr(conn, addr, sizeof(addr), 1);
-        connFormatAddr(conn, laddr, sizeof(addr), 0);
-        serverLog(LL_VERBOSE, "Accepted client connection in error state: %s (addr=%s laddr=%s)",
-                  connGetLastError(conn), addr, laddr);
-        connClose(conn);
-        return;
-    }
-
-    /* Limit the number of connections we take at the same time.
-     *
-     * Admission control will happen before a client is created and connAccept()
-     * called, because we don't want to even start transport-level negotiation
-     * if rejected. */
-    if (listLength(server.clients) + getClusterConnectionsCount() >= server.maxclients) {
-        char *err;
-        if (server.cluster_enabled)
-            err = "-ERR max number of clients + cluster "
-                  "connections reached\r\n";
-        else
-            err = "-ERR max number of clients reached\r\n";
-
-        /* That's a best effort error message, don't check write errors.
-         * Note that for TLS connections, no handshake was done yet so nothing
-         * is written and the connection will just drop. */
-        if (connWrite(conn, err, strlen(err)) == -1) {
-            /* Nothing to do, Just to avoid the warning... */
-        }
-        server.stat_rejected_conn++;
-        connClose(conn);
-        return;
-    }
-
-    /* Create connection and client */
-    if ((c = createClient(conn)) == NULL) {
-        char addr[NET_ADDR_STR_LEN] = {0};
-        char laddr[NET_ADDR_STR_LEN] = {0};
-        connFormatAddr(conn, addr, sizeof(addr), 1);
-        connFormatAddr(conn, laddr, sizeof(addr), 0);
-        serverLog(LL_WARNING, "Error registering fd event for the new client connection: %s (addr=%s laddr=%s)",
-                  connGetLastError(conn), addr, laddr);
-        connClose(conn); /* May be already closed, just ignore errors */
-        return;
-    }
-
-    /* Last chance to keep flags */
-    if (flags.unix_socket) c->flag.unix_socket = 1;
-
-    /* Initiate accept.
-     *
-     * Note that connAccept() is free to do two things here:
-     * 1. Call clientAcceptHandler() immediately;
-     * 2. Schedule a future call to clientAcceptHandler().
-     *
-     * Because of that, we must do nothing else afterwards.
-     */
-    if (connAccept(conn, clientAcceptHandler) == C_ERR) {
-        if (connGetState(conn) == CONN_STATE_ERROR)
-            serverLog(LL_WARNING, "Error accepting a client connection: %s (addr=%s laddr=%s)", connGetLastError(conn),
-                      getClientPeerId(c), getClientSockname(c));
-        freeClient(connGetPrivateData(conn));
-        return;
-    }
 }
 
 void freeClientOriginalArgv(client *c) {
@@ -1484,45 +1228,14 @@ void freeClientOriginalArgv(client *c) {
 }
 
 void freeClientArgv(client *c) {
-    if (tryOffloadFreeArgvToIOThreads(c) == C_ERR) {
-        for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
-        zfree(c->argv);
-    }
+    for (int j = 0; j < c->argc; j++) decrRefCount(c->argv[j]);
+    zfree(c->argv);
     c->argc = 0;
     c->cmd = NULL;
     c->io_parsed_cmd = NULL;
     c->argv_len_sum = 0;
     c->argv_len = 0;
     c->argv = NULL;
-}
-
-/* Close all the replicas connections. This is useful in chained replication
- * when we resync with our own primary and want to force all our replicas to
- * resync with us as well. */
-void disconnectReplicas(void) {
-    listIter li;
-    listNode *ln;
-    listRewind(server.replicas, &li);
-    while ((ln = listNext(&li))) {
-        freeClient((client *)ln->value);
-    }
-}
-
-/* Check if there is any other replica waiting dumping RDB finished expect me.
- * This function is useful to judge current dumping RDB can be used for full
- * synchronization or not. */
-int anyOtherReplicaWaitRdb(client *except_me) {
-    listIter li;
-    listNode *ln;
-
-    listRewind(server.replicas, &li);
-    while ((ln = listNext(&li))) {
-        client *replica = ln->value;
-        if (replica != except_me && replica->repl_state == REPLICA_STATE_WAIT_BGSAVE_END) {
-            return 1;
-        }
-    }
-    return 0;
 }
 
 /* Remove the specified client from global lists where the client could
@@ -1545,20 +1258,7 @@ void unlinkClient(client *c) {
             listDelNode(server.clients, c->client_list_node);
             c->client_list_node = NULL;
         }
-        removeClientFromPendingCommandsBatch(c);
 
-        /* Check if this is a replica waiting for diskless replication (rdb pipe),
-         * in which case it needs to be cleaned from that list */
-        if (c->flag.replica && c->repl_state == REPLICA_STATE_WAIT_BGSAVE_END && server.rdb_pipe_conns) {
-            int i;
-            for (i = 0; i < server.rdb_pipe_numconns; i++) {
-                if (server.rdb_pipe_conns[i] == c->conn) {
-                    rdbPipeWriteHandlerConnRemoved(c->conn);
-                    server.rdb_pipe_conns[i] = NULL;
-                    break;
-                }
-            }
-        }
         /* Only use shutdown when the fork is active and we are the parent. */
         if (server.child_type && !c->flag.repl_rdb_channel) {
             connShutdown(c->conn);
@@ -1596,9 +1296,6 @@ void unlinkClient(client *c) {
         listDelNode(server.unblocked_clients, ln);
         c->flag.unblocked = 0;
     }
-
-    /* Clear the tracking status. */
-    if (c->flag.tracking) disableTracking(c);
 }
 
 /* Clear the client state to resemble a newly connected client. */
@@ -1619,15 +1316,9 @@ void clearClientConnectionState(client *c) {
 
     serverAssert(!(c->flag.replica || c->flag.primary));
 
-    if (c->flag.tracking) disableTracking(c);
     selectDb(c, 0);
-#ifdef LOG_REQ_RES
-    c->resp = server.client_default_resp;
-#else
     c->resp = 2;
-#endif
 
-    clientSetDefaultAuth(c);
     moduleNotifyUserChanged(c);
     discardTransaction(c);
 
@@ -1663,9 +1354,6 @@ void freeClient(client *c) {
         return;
     }
 
-    /* Wait for IO operations to be done before proceeding */
-    waitForClientIO(c);
-
     /* For connected clients, call the disconnection event of modules hooks. */
     if (c->conn) {
         moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_DISCONNECTED, c);
@@ -1685,29 +1373,6 @@ void freeClient(client *c) {
         ln = listSearchKey(server.clients_to_close, c);
         serverAssert(ln != NULL);
         listDelNode(server.clients_to_close, ln);
-    }
-
-    /* If it is our primary that's being disconnected we should make sure
-     * to cache the state to try a partial resynchronization later.
-     *
-     * Note that before doing this we make sure that the client is not in
-     * some unexpected state, by checking its flags. */
-    if (server.primary && c->flag.primary) {
-        serverLog(LL_NOTICE, "Connection with primary lost.");
-        if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
-            c->flag.close_asap = 0;
-            c->flag.close_after_reply = 0;
-            replicationCachePrimary(c);
-            return;
-        }
-    }
-
-    /* Log link disconnection with replica */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        serverLog(LL_NOTICE,
-                  c->flag.repl_rdb_channel ? "Replica %s rdb channel disconnected."
-                                           : "Connection with replica %s lost.",
-                  replicationGetReplicaName(c));
     }
 
     /* Free the query buffer */
@@ -1740,13 +1405,9 @@ void freeClient(client *c) {
     /* Free data structures. */
     listRelease(c->reply);
     zfree(c->buf);
-    freeReplicaReferencedReplBuffer(c);
     freeClientArgv(c);
     freeClientOriginalArgv(c);
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
-#ifdef LOG_REQ_RES
-    reqresReset(c, 1);
-#endif
 
     /* Remove the contribution that this client gave to our
      * incrementally computed memory usage. */
@@ -1756,45 +1417,6 @@ void freeClient(client *c) {
      * handlers, and remove references of the client from different
      * places where active clients may be referenced. */
     unlinkClient(c);
-
-    /* Primary/replica cleanup Case 1:
-     * we lost the connection with a replica. */
-    if (c->flag.replica) {
-        /* If there is no any other replica waiting dumping RDB finished, the
-         * current child process need not continue to dump RDB, then we kill it.
-         * So child process won't use more memory, and we also can fork a new
-         * child process asap to dump rdb for next full synchronization or bgsave.
-         * But we also need to check if users enable 'save' RDB, if enable, we
-         * should not remove directly since that means RDB is important for users
-         * to keep data safe and we may delay configured 'save' for full sync. */
-        if (server.saveparamslen == 0 && c->repl_state == REPLICA_STATE_WAIT_BGSAVE_END &&
-            server.child_type == CHILD_TYPE_RDB && server.rdb_child_type == RDB_CHILD_TYPE_DISK &&
-            anyOtherReplicaWaitRdb(c) == 0) {
-            killRDBChild();
-        }
-        if (c->repl_state == REPLICA_STATE_SEND_BULK) {
-            if (c->repldbfd != -1) close(c->repldbfd);
-            if (c->replpreamble) sdsfree(c->replpreamble);
-        }
-        list *l = (c->flag.monitor) ? server.monitors : server.replicas;
-        ln = listSearchKey(l, c);
-        serverAssert(ln != NULL);
-        listDelNode(l, ln);
-        /* We need to remember the time when we started to have zero
-         * attached replicas, as after some time we'll free the replication
-         * backlog. */
-        if (getClientType(c) == CLIENT_TYPE_REPLICA && listLength(server.replicas) == 0)
-            server.repl_no_replicas_since = server.unixtime;
-        refreshGoodReplicasCount();
-        /* Fire the replica change modules event. */
-        if (c->repl_state == REPLICA_STATE_ONLINE)
-            moduleFireServerEvent(VALKEYMODULE_EVENT_REPLICA_CHANGE, VALKEYMODULE_SUBEVENT_REPLICA_CHANGE_OFFLINE,
-                                  NULL);
-    }
-
-    /* Primary/replica cleanup Case 2:
-     * we lost the connection with the primary. */
-    if (c->flag.primary) replicationHandlePrimaryDisconnection();
 
     /* Remove client from memory usage buckets */
     if (c->mem_usage_bucket) {
@@ -1920,11 +1542,6 @@ void beforeNextClient(client *c) {
     }
 
     updateClientMemUsageAndBucket(c);
-    /* If IO threads are enabled try to write immediately the reply instead of waiting to beforeSleep,
-     * unless aof_fsync is set to always in which case we need to wait for beforeSleep after writing the aof buffer. */
-    if (server.aof_fsync != AOF_FSYNC_ALWAYS) {
-        trySendWriteToIOThreads(c);
-    }
 }
 
 /* Free the clients marked as CLOSE_ASAP, return the number of clients
@@ -1937,26 +1554,6 @@ int freeClientsInAsyncFreeQueue(void) {
     listRewind(server.clients_to_close, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-
-        if (c->flag.protected_rdb_channel) {
-            /* Check if it's safe to remove RDB connection protection during synchronization
-             * The primary gives a grace period before freeing this client because
-             * it serves as a reference to the first required replication data block for
-             * this replica */
-            if (!c->rdb_client_disconnect_time) {
-                if (c->conn) connSetReadHandler(c->conn, NULL);
-                c->rdb_client_disconnect_time = server.unixtime;
-                serverLog(LL_VERBOSE, "Postpone RDB client id=%llu (%s) free for %d seconds", (unsigned long long)c->id,
-                          replicationGetReplicaName(c), server.wait_before_rdb_client_free);
-            }
-            if (server.unixtime - c->rdb_client_disconnect_time <= server.wait_before_rdb_client_free) continue;
-            serverLog(LL_NOTICE,
-                      "Replica main channel failed to establish PSYNC within the grace period (%ld seconds). "
-                      "Freeing RDB client %llu.",
-                      (long int)(server.unixtime - c->rdb_client_disconnect_time), (unsigned long long)c->id);
-            c->flag.protected_rdb_channel = 0;
-        }
-
         if (c->flag.protected) continue;
 
         c->flag.close_asap = 0;
@@ -1977,38 +1574,6 @@ client *lookupClientByID(uint64_t id) {
     return c;
 }
 
-void writeToReplica(client *c) {
-    /* Can be called from main-thread only as replica write offload is not supported yet */
-    serverAssert(inMainThread());
-    int nwritten = 0;
-    serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
-    while (clientHasPendingReplies(c)) {
-        replBufBlock *o = listNodeValue(c->ref_repl_buf_node);
-        serverAssert(o->used >= c->ref_block_pos);
-
-        /* Send current block if it is not fully sent. */
-        if (o->used > c->ref_block_pos) {
-            nwritten = connWrite(c->conn, o->buf + c->ref_block_pos, o->used - c->ref_block_pos);
-            if (nwritten <= 0) {
-                c->write_flags |= WRITE_FLAGS_WRITE_ERROR;
-                return;
-            }
-            c->nwritten += nwritten;
-            c->ref_block_pos += nwritten;
-        }
-
-        /* If we fully sent the object on head, go to the next one. */
-        listNode *next = listNextNode(c->ref_repl_buf_node);
-        if (next && c->ref_block_pos == o->used) {
-            o->refcount--;
-            ((replBufBlock *)(listNodeValue(next)))->refcount++;
-            c->ref_repl_buf_node = next;
-            c->ref_block_pos = 0;
-            incrementalTrimReplicationBacklog(REPL_BACKLOG_TRIM_BLOCKS_PER_CALL);
-        }
-    }
-}
-
 /* This function should be called from _writeToClient when the reply list is not empty,
  * it gathers the scattered buffers from reply list and sends them away with connWritev.
  * If we write successfully, it returns C_OK, otherwise, C_ERR is returned.
@@ -2022,13 +1587,8 @@ static int writevToClient(client *c) {
     ssize_t bufpos, iov_bytes_len = 0;
     listNode *lastblock;
 
-    if (inMainThread()) {
-        lastblock = listLast(c->reply);
-        bufpos = c->bufpos;
-    } else {
-        lastblock = c->io_last_reply_block;
-        bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
-    }
+    lastblock = listLast(c->reply);
+    bufpos = c->bufpos;
 
     /* If the static reply buffer is not empty,
      * add it to the iov array for writev() as well. */
@@ -2049,12 +1609,6 @@ static int writevToClient(client *c) {
         o = listNodeValue(next);
 
         used = o->used;
-        /* Use c->io_last_bufpos as the currently used portion of the block.
-         *  We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
-         * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
-         * that may not yet be visible to the current thread*/
-        if (!inMainThread() && next == lastblock) used = c->io_last_bufpos;
-
         if (used == 0) { /* empty node, skip over it. */
             if (next == lastblock) break;
             sentlen = 0;
@@ -2122,15 +1676,9 @@ int _writeToClient(client *c) {
     listNode *lastblock;
     size_t bufpos;
 
-    if (inMainThread()) {
-        /* In the main thread, access bufpos and lastblock directly */
-        lastblock = listLast(c->reply);
-        bufpos = (size_t)c->bufpos;
-    } else {
-        /* If there is a last block, use bufpos directly; otherwise, use io_last_bufpos */
-        bufpos = c->io_last_reply_block ? (size_t)c->bufpos : c->io_last_bufpos;
-        lastblock = c->io_last_reply_block;
-    }
+    /* In the main thread, access bufpos and lastblock directly */
+    lastblock = listLast(c->reply);
+    bufpos = (size_t)c->bufpos;
 
     /* If the reply list is not empty, use writev to save system calls and TCP packets */
     if (lastblock) return writevToClient(c);
@@ -2197,12 +1745,7 @@ int postWriteToClient(client *c) {
     c->io_last_reply_block = NULL;
     c->io_last_bufpos = 0;
     /* Update total number of writes on server */
-    server.stat_total_writes_processed++;
-    if (getClientType(c) != CLIENT_TYPE_REPLICA) {
-        _postWriteToClient(c);
-    } else {
-        server.stat_net_repl_output_bytes += c->nwritten > 0 ? c->nwritten : 0;
-    }
+    _postWriteToClient(c);
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         if (connGetState(c->conn) != CONN_STATE_CONNECTED) {
@@ -2247,11 +1790,7 @@ int writeToClient(client *c) {
     c->nwritten = 0;
     c->write_flags = 0;
 
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        writeToReplica(c);
-    } else {
-        _writeToClient(c);
-    }
+    _writeToClient(c);
 
     return postWriteToClient(c);
 }
@@ -2259,7 +1798,6 @@ int writeToClient(client *c) {
 /* Write event handler. Just send data to the client. */
 void sendReplyToClient(connection *conn) {
     client *c = connGetPrivateData(conn);
-    if (trySendWriteToIOThreads(c) == C_OK) return;
     writeToClient(c);
 }
 
@@ -2284,7 +1822,6 @@ void handleQbLimitReached(client *c) {
  *   - C_OK if the querybuf can be further processed.
  *   - C_ERR if not. */
 int handleReadResult(client *c) {
-    serverAssert(inMainThread());
     server.stat_total_reads_processed++;
     if (c->nread <= 0) {
         if (c->nread == -1) {
@@ -2376,10 +1913,6 @@ parseResult handleParseResults(client *c) {
         return PARSE_ERR;
     }
 
-    if (c->read_flags & READ_FLAGS_INLINE_ZERO_QUERY_LEN && getClientType(c) == CLIENT_TYPE_REPLICA) {
-        c->repl_ack_time = server.unixtime;
-    }
-
     if (c->read_flags & READ_FLAGS_INLINE_ZERO_QUERY_LEN) {
         /* in case the client's query was an empty line we will ignore it and proceed to process the rest of the buffer
          * if any */
@@ -2405,6 +1938,7 @@ parseResult handleParseResults(client *c) {
  * allow_async_writes - A flag indicating whether I/O threads can handle pending writes for this client.
  * returns 1 if processing completed successfully, 0 if processing is skipped. */
 int processClientIOWriteDone(client *c, int allow_async_writes) {
+    UNUSED(allow_async_writes);
     /* memory barrier acquire to get the latest client state */
     atomic_thread_fence(memory_order_acquire);
     /* If a client is protected, don't proceed to check the write results as it may trigger conn close. */
@@ -2416,9 +1950,6 @@ int processClientIOWriteDone(client *c, int allow_async_writes) {
 
     /* Don't post-process-writes to clients that are going to be closed anyway. */
     if (c->flag.close_asap) return 0;
-
-    /* Update processed count on server */
-    server.stat_io_writes_processed += 1;
 
     connSetPostponeUpdateState(c->conn, 0);
     connUpdateState(c->conn);
@@ -2432,39 +1963,12 @@ int processClientIOWriteDone(client *c, int allow_async_writes) {
              * able to write everything in one go. */
             installClientWriteHandler(c);
         } else {
-            /* If we can send the client to the I/O thread, let it handle the write. */
-            if (allow_async_writes && trySendWriteToIOThreads(c) == C_OK) return 1;
             /* Try again in the next eventloop */
             putClientInPendingWriteQueue(c);
         }
     }
 
     return 1;
-}
-
-/* This function handles the post-processing of I/O write operations that have been
- * completed for clients. It iterates through the list of clients with pending I/O
- * writes and performs necessary actions based on their current state.
- *
- * Returns The number of clients processed during this function call. */
-int processIOThreadsWriteDone(void) {
-    if (listLength(server.clients_pending_io_write) == 0) return 0;
-    int processed = 0;
-    listNode *ln;
-
-    listNode *next = listFirst(server.clients_pending_io_write);
-    while (next) {
-        ln = next;
-        next = listNextNode(ln);
-        client *c = listNodeValue(ln);
-
-        /* Client is still waiting for a pending I/O - skip it */
-        if (c->io_write_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_PENDING_IO) continue;
-
-        processed += processClientIOWriteDone(c, 1);
-    }
-
-    return processed;
 }
 
 /* This function is called just before entering the event loop, in the hope
@@ -2475,10 +1979,6 @@ int handleClientsWithPendingWrites(void) {
     int processed = 0;
     int pending_writes = listLength(server.clients_pending_write);
     if (pending_writes == 0) return processed; /* Return ASAP if there are no clients. */
-
-    /* Adjust the number of I/O threads based on the number of pending writes this is required in case pending_writes >
-     * poll_events (for example in pubsub) */
-    adjustIOThreadsByEventLoad(pending_writes, 1);
 
     listIter li;
     listNode *ln;
@@ -2496,9 +1996,6 @@ int handleClientsWithPendingWrites(void) {
         if (c->flag.close_asap) continue;
 
         if (!clientHasPendingReplies(c)) continue;
-
-        /* If we can send the client to the I/O thread, let it handle the write. */
-        if (trySendWriteToIOThreads(c) == C_OK) continue;
 
         /* We can't write to the client while IO operation is in progress. */
         if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) continue;
@@ -2534,16 +2031,9 @@ void resetClient(client *c) {
 
     /* Make sure the duration has been recorded to some command. */
     serverAssert(c->duration == 0);
-#ifdef LOG_REQ_RES
-    reqresReset(c, 1);
-#endif
 
     if (c->deferred_reply_errors) listRelease(c->deferred_reply_errors);
     c->deferred_reply_errors = NULL;
-
-    /* We clear the ASKING flag as well if we are not inside a MULTI, and
-     * if what we just executed is not the ASKING command itself. */
-    if (!c->flag.multi && prevcmd != askingCommand) c->flag.asking = 0;
 
     /* We do the same for the CACHING command as well. It also affects
      * the next command or transaction executed, in a way very similar
@@ -2599,100 +2089,9 @@ void unprotectClient(client *c) {
     if (c->flag.protected) {
         c->flag.protected = 0;
         if (c->conn) {
-            connSetReadHandler(c->conn, readQueryFromClient);
             if (clientHasPendingReplies(c)) putClientInPendingWriteQueue(c);
         }
     }
-}
-
-/* Like processMultibulkBuffer(), but for the inline protocol instead of RESP,
- * this function consumes the client query buffer and creates a command ready
- * to be executed inside the client structure.
- * Sets the client read_flags to indicate the parsing outcome. */
-void processInlineBuffer(client *c) {
-    char *newline;
-    int argc, j, linefeed_chars = 1;
-    sds *argv, aux;
-    size_t querylen;
-    int is_primary = c->read_flags & READ_FLAGS_PRIMARY;
-
-    /* Search for end of line */
-    newline = strchr(c->querybuf + c->qb_pos, '\n');
-
-    /* Nothing to do without a \r\n */
-    if (newline == NULL) {
-        if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
-            c->read_flags |= READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
-        }
-        return;
-    }
-
-    /* Handle the \r\n case. */
-    if (newline != c->querybuf + c->qb_pos && *(newline - 1) == '\r') newline--, linefeed_chars++;
-
-    /* Split the input buffer up to the \r\n */
-    querylen = newline - (c->querybuf + c->qb_pos);
-    aux = sdsnewlen(c->querybuf + c->qb_pos, querylen);
-    argv = sdssplitargs(aux, &argc);
-    sdsfree(aux);
-    if (argv == NULL) {
-        c->read_flags |= READ_FLAGS_ERROR_UNBALANCED_QUOTES;
-        return;
-    }
-
-    if (querylen == 0) {
-        c->read_flags |= READ_FLAGS_INLINE_ZERO_QUERY_LEN;
-    }
-
-    /* Primaries should never send us inline protocol to run actual
-     * commands. If this happens, it is likely due to a bug in the server where
-     * we got some desynchronization in the protocol, for example
-     * because of a PSYNC gone bad.
-     *
-     * However there is an exception: primaries may send us just a newline
-     * to keep the connection active. */
-    if (querylen != 0 && is_primary) {
-        sdsfreesplitres(argv, argc);
-        c->read_flags |= READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_PRIMARY;
-        return;
-    }
-
-    /* Move querybuffer position to the next query in the buffer. */
-    c->qb_pos += querylen + linefeed_chars;
-
-    /* Setup argv array on client structure */
-    if (argc) {
-        if (c->argv) zfree(c->argv);
-        c->argv_len = argc;
-        c->argv = zmalloc(sizeof(robj *) * c->argv_len);
-        c->argv_len_sum = 0;
-    }
-
-    /* Create an Object for all arguments. */
-    for (c->argc = 0, j = 0; j < argc; j++) {
-        /* Strings returned from sdssplitargs() may have unused capacity that we can trim. */
-        argv[j] = sdsRemoveFreeSpace(argv[j], 1);
-        c->argv[c->argc] = createObject(OBJ_STRING, argv[j]);
-        c->argc++;
-        c->argv_len_sum += sdslen(argv[j]);
-    }
-    zfree(argv);
-
-    /* Per-slot network bytes-in calculation.
-     *
-     * We calculate and store the current command's ingress bytes under
-     * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
-     * until c->slot is parsed later within processCommand().
-     *
-     * Calculation: For inline buffer, every whitespace is of length 1,
-     * with the exception of the trailing '\r\n' being length 2.
-     *
-     * For example;
-     * Command) SET key value
-     * Inline) SET key value\r\n
-     * */
-    c->net_input_bytes_curr_cmd = (c->argv_len_sum + (c->argc - 1) + 2);
-    c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
 }
 
 /* Helper function. Record protocol error details in server log,
@@ -2730,207 +2129,6 @@ static void setProtocolError(const char *errstr, client *c) {
     c->flag.protocol_error = 1;
 }
 
-/* Process the query buffer for client 'c', setting up the client argument
- * vector for command execution.
- * Sets the client's read_flags to indicate the parsing outcome.
- *
- * This function is called if processInputBuffer() detects that the next
- * command is in RESP format, so the first byte in the command is found
- * to be '*'. Otherwise for inline commands processInlineBuffer() is called. */
-void processMultibulkBuffer(client *c) {
-    char *newline = NULL;
-    int ok;
-    long long ll;
-    int is_primary = c->read_flags & READ_FLAGS_PRIMARY;
-    int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
-
-    if (c->multibulklen == 0) {
-        /* The client should have been reset */
-        serverAssertWithInfo(c, NULL, c->argc == 0);
-
-        /* Multi bulk length cannot be read without a \r\n */
-        newline = strchr(c->querybuf + c->qb_pos, '\r');
-        if (newline == NULL) {
-            if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
-                c->read_flags |= READ_FLAGS_ERROR_BIG_MULTIBULK;
-            }
-            return;
-        }
-
-        /* Buffer should also contain \n */
-        if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) return;
-
-        /* We know for sure there is a whole line since newline != NULL,
-         * so go ahead and find out the multi bulk length. */
-        serverAssertWithInfo(c, NULL, c->querybuf[c->qb_pos] == '*');
-        size_t multibulklen_slen = newline - (c->querybuf + 1 + c->qb_pos);
-        ok = string2ll(c->querybuf + 1 + c->qb_pos, multibulklen_slen, &ll);
-        if (!ok || ll > INT_MAX) {
-            c->read_flags |= READ_FLAGS_ERROR_INVALID_MULTIBULK_LEN;
-            return;
-        } else if (ll > 10 && auth_required) {
-            c->read_flags |= READ_FLAGS_ERROR_UNAUTHENTICATED_MULTIBULK_LEN;
-            return;
-        }
-
-        c->qb_pos = (newline - c->querybuf) + 2;
-
-        if (ll <= 0) {
-            c->read_flags |= READ_FLAGS_PARSING_NEGATIVE_MBULK_LEN;
-            return;
-        }
-
-        c->multibulklen = ll;
-
-        /* Setup argv array on client structure */
-        if (c->argv) zfree(c->argv);
-        c->argv_len = min(c->multibulklen, 1024);
-        c->argv = zmalloc(sizeof(robj *) * c->argv_len);
-        c->argv_len_sum = 0;
-
-        /* Per-slot network bytes-in calculation.
-         *
-         * We calculate and store the current command's ingress bytes under
-         * c->net_input_bytes_curr_cmd, for which its per-slot aggregation is deferred
-         * until c->slot is parsed later within processCommand().
-         *
-         * Calculation: For multi bulk buffer, we accumulate four factors, namely;
-         *
-         * 1) multibulklen_slen + 1
-         *    Cumulative string length (and not the value of) of multibulklen,
-         *    including +1 from RESP first byte.
-         * 2) bulklen_slen + c->argc
-         *    Cumulative string length (and not the value of) of bulklen,
-         *    including +1 from RESP first byte per argument count.
-         * 3) c->argv_len_sum
-         *    Cumulative string length of all argument vectors.
-         * 4) c->argc * 4 + 2
-         *    Cumulative string length of all white-spaces, for which there exists a total of
-         *    4 bytes per argument, plus 2 bytes from the leading '\r\n' from multibulklen.
-         *
-         * For example;
-         * Command) SET key value
-         * RESP) *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
-         *
-         * 1) String length of "*3" is 2, obtained from (multibulklen_slen + 1).
-         * 2) String length of "$3" "$3" "$5" is 6, obtained from (bulklen_slen + c->argc).
-         * 3) String length of "SET" "key" "value" is 11, obtained from (c->argv_len_sum).
-         * 4) String length of all white-spaces "\r\n" is 14, obtained from (c->argc * 4 + 2).
-         *
-         * The 1st component is calculated within the below line.
-         * */
-        c->net_input_bytes_curr_cmd += (multibulklen_slen + 1);
-    }
-
-    serverAssertWithInfo(c, NULL, c->multibulklen > 0);
-    while (c->multibulklen) {
-        /* Read bulk length if unknown */
-        if (c->bulklen == -1) {
-            newline = strchr(c->querybuf + c->qb_pos, '\r');
-            if (newline == NULL) {
-                if (sdslen(c->querybuf) - c->qb_pos > PROTO_INLINE_MAX_SIZE) {
-                    c->read_flags |= READ_FLAGS_ERROR_BIG_BULK_COUNT;
-                    return;
-                }
-                break;
-            }
-
-            /* Buffer should also contain \n */
-            if (newline - (c->querybuf + c->qb_pos) > (ssize_t)(sdslen(c->querybuf) - c->qb_pos - 2)) break;
-
-            if (c->querybuf[c->qb_pos] != '$') {
-                c->read_flags |= READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER;
-                return;
-            }
-
-            size_t bulklen_slen = newline - (c->querybuf + c->qb_pos + 1);
-            ok = string2ll(c->querybuf + c->qb_pos + 1, bulklen_slen, &ll);
-            if (!ok || ll < 0 || (!(is_primary) && ll > server.proto_max_bulk_len)) {
-                c->read_flags |= READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN;
-                return;
-            } else if (ll > 16384 && auth_required) {
-                c->read_flags |= READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN;
-                return;
-            }
-
-            c->qb_pos = newline - c->querybuf + 2;
-            if (!(is_primary) && ll >= PROTO_MBULK_BIG_ARG) {
-                /* When the client is not a primary client (because primary
-                 * client's querybuf can only be trimmed after data applied
-                 * and sent to replicas).
-                 *
-                 * If we are going to read a large object from network
-                 * try to make it likely that it will start at c->querybuf
-                 * boundary so that we can optimize object creation
-                 * avoiding a large copy of data.
-                 *
-                 * But only when the data we have not parsed is less than
-                 * or equal to ll+2. If the data length is greater than
-                 * ll+2, trimming querybuf is just a waste of time, because
-                 * at this time the querybuf contains not only our bulk. */
-                if (sdslen(c->querybuf) - c->qb_pos <= (size_t)ll + 2) {
-                    if (c->querybuf == thread_shared_qb) {
-                        /* Let the client take the ownership of the shared buffer. */
-                        initSharedQueryBuf();
-                    }
-                    sdsrange(c->querybuf, c->qb_pos, -1);
-                    c->qb_pos = 0;
-                    /* Hint the sds library about the amount of bytes this string is
-                     * going to contain. */
-                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, ll + 2 - sdslen(c->querybuf));
-                    /* We later set the peak to the used portion of the buffer, but here we over
-                     * allocated because we know what we need, make sure it'll not be shrunk before used. */
-                    if (c->querybuf_peak < (size_t)ll + 2) c->querybuf_peak = ll + 2;
-                }
-            }
-            c->bulklen = ll;
-            /* Per-slot network bytes-in calculation, 2nd component.
-             * c->argc portion is deferred, as it may not have been fully populated at this point. */
-            c->net_input_bytes_curr_cmd += bulklen_slen;
-        }
-
-        /* Read bulk argument */
-        if (sdslen(c->querybuf) - c->qb_pos < (size_t)(c->bulklen + 2)) {
-            /* Not enough data (+2 == trailing \r\n) */
-            break;
-        } else {
-            /* Check if we have space in argv, grow if needed */
-            if (c->argc >= c->argv_len) {
-                c->argv_len = min(c->argv_len < INT_MAX / 2 ? c->argv_len * 2 : INT_MAX, c->argc + c->multibulklen);
-                c->argv = zrealloc(c->argv, sizeof(robj *) * c->argv_len);
-            }
-
-            /* Optimization: if a non-primary client's buffer contains JUST our bulk element
-             * instead of creating a new object by *copying* the sds we
-             * just use the current sds string. */
-            if (!is_primary && c->qb_pos == 0 && c->bulklen >= PROTO_MBULK_BIG_ARG &&
-                sdslen(c->querybuf) == (size_t)(c->bulklen + 2)) {
-                c->argv[c->argc++] = createObject(OBJ_STRING, c->querybuf);
-                c->argv_len_sum += c->bulklen;
-                sdsIncrLen(c->querybuf, -2); /* remove CRLF */
-                /* Assume that if we saw a fat argument we'll see another one
-                 * likely... */
-                c->querybuf = sdsnewlen(SDS_NOINIT, c->bulklen + 2);
-                sdsclear(c->querybuf);
-            } else {
-                c->argv[c->argc++] = createStringObject(c->querybuf + c->qb_pos, c->bulklen);
-                c->argv_len_sum += c->bulklen;
-                c->qb_pos += c->bulklen + 2;
-            }
-            c->bulklen = -1;
-            c->multibulklen--;
-        }
-    }
-
-    /* We're done when c->multibulk == 0 */
-    if (c->multibulklen == 0) {
-        /* Per-slot network bytes-in calculation, 3rd and 4th components.
-         * Here, the deferred c->argc from 2nd component is added, resulting in c->argc * 5 instead of * 4. */
-        c->net_input_bytes_curr_cmd += (c->argv_len_sum + (c->argc * 5 + 2));
-        c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
-    }
-}
-
 /* Perform necessary tasks after a command was executed:
  *
  * 1. The client is reset unless there are reasons to avoid doing it.
@@ -2946,28 +2144,11 @@ void commandProcessed(client *c) {
      *    since we have not applied the command. */
     if (c->flag.blocked) return;
 
-    reqresAppendResponse(c);
-    clusterSlotStatsAddNetworkBytesInForUserClient(c);
     resetClient(c);
 
-    long long prev_offset = c->reploff;
     if (c->flag.primary && !c->flag.multi) {
         /* Update the applied replication offset of our primary. */
         c->reploff = c->read_reploff - sdslen(c->querybuf) + c->qb_pos;
-    }
-
-    /* If the client is a primary we need to compute the difference
-     * between the applied offset before and after processing the buffer,
-     * to understand how much of the replication stream was actually
-     * applied to the primary state: this quantity, and its corresponding
-     * part of the replication stream, will be propagated to the
-     * sub-replicas and to the replication backlog. */
-    if (c->flag.primary) {
-        long long applied = c->reploff - prev_offset;
-        if (applied) {
-            replicationFeedStreamFromPrimaryStream(c->querybuf + c->repl_applied, applied);
-            c->repl_applied += applied;
-        }
     }
 }
 
@@ -3020,272 +2201,12 @@ int processPendingCommandAndInputBuffer(client *c) {
             return C_ERR;
         }
     }
-
-    /* Now process client if it has more data in it's buffer.
-     *
-     * Note: when a primary client steps into this function,
-     * it can always satisfy this condition, because its querybuf
-     * contains data not applied. */
-    if (c->querybuf && sdslen(c->querybuf) > 0) {
-        return processInputBuffer(c);
-    }
     return C_OK;
-}
-
-/* Parse a single command from the query buf.
- *
- * This function may be called from the main thread or from the I/O thread.
- *
- * Sets the client's read_flags to indicate the parsing outcome */
-void parseCommand(client *c) {
-    /* Determine request type when unknown. */
-    if (!c->reqtype) {
-        if (c->querybuf[c->qb_pos] == '*') {
-            c->reqtype = PROTO_REQ_MULTIBULK;
-        } else {
-            c->reqtype = PROTO_REQ_INLINE;
-        }
-    }
-
-    if (c->reqtype == PROTO_REQ_INLINE) {
-        processInlineBuffer(c);
-    } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
-        processMultibulkBuffer(c);
-    } else {
-        serverPanic("Unknown request type");
-    }
-}
-
-int canParseCommand(client *c) {
-    if (c->cmd != NULL) return 0;
-
-    /* Don't parse a command if the client is in the middle of something. */
-    if (c->flag.blocked || c->flag.unblocked) return 0;
-
-    /* Don't process more buffers from clients that have already pending
-     * commands to execute in c->argv. */
-    if (c->flag.pending_command) return 0;
-
-    /* Don't process input from the primary while there is a busy script
-     * condition on the replica. We want just to accumulate the replication
-     * stream (instead of replying -BUSY like we do with other clients) and
-     * later resume the processing. */
-    if (isInsideYieldingLongCommand() && c->flag.primary) return 0;
-
-    /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
-     * written to the client. Make sure to not let the reply grow after
-     * this flag has been set (i.e. don't process more commands).
-     *
-     * The same applies for clients we want to terminate ASAP. */
-    if (c->flag.close_after_reply || c->flag.close_asap) return 0;
-
-    return 1;
-}
-
-int processInputBuffer(client *c) {
-    /* Parse the query buffer. */
-    while (c->querybuf && c->qb_pos < sdslen(c->querybuf)) {
-        if (!canParseCommand(c)) {
-            break;
-        }
-
-        c->read_flags = c->flag.primary ? READ_FLAGS_PRIMARY : 0;
-        c->read_flags |= authRequired(c) ? READ_FLAGS_AUTH_REQUIRED : 0;
-
-        parseCommand(c);
-
-        if (handleParseResults(c) != PARSE_OK) {
-            break;
-        }
-
-        if (c->argc == 0) {
-            /* No command to process - continue parsing the query buf. */
-            continue;
-        }
-
-        if (c->querybuf == thread_shared_qb) {
-            /* Before processing the command, reset the shared query buffer to its default state.
-             * This avoids unintentionally modifying the shared qb during processCommand as we may use
-             * the shared qb for other clients during processEventsWhileBlocked */
-            resetSharedQueryBuf(c);
-        }
-
-        /* We are finally ready to execute the command. */
-        if (processCommandAndResetClient(c) == C_ERR) {
-            /* If the client is no longer valid, we avoid exiting this
-             * loop and trimming the client buffer later. So we return
-             * ASAP in that case. */
-            return C_ERR;
-        }
-    }
-
-    return C_OK;
-}
-
-/* This function can be called from the main-thread or from the IO-thread.
- * The function allocates query-buf for the client if required and reads to it from the network.
- * It will set c->nread to the bytes read from the network. */
-void readToQueryBuf(client *c) {
-    int big_arg = 0;
-    size_t qblen, readlen;
-
-    /* If the replica RDB client is marked as closed ASAP, do not try to read from it */
-    if (c->flag.close_asap) return;
-
-    int is_primary = c->read_flags & READ_FLAGS_PRIMARY;
-
-    readlen = PROTO_IOBUF_LEN;
-    qblen = c->querybuf ? sdslen(c->querybuf) : 0;
-    /* If this is a multi bulk request, and we are processing a bulk reply
-     * that is large enough, try to maximize the probability that the query
-     * buffer contains exactly the SDS string representing the object, even
-     * at the risk of requiring more read(2) calls. This way the function
-     * processMultiBulkBuffer() can avoid copying buffers to create the
-     * robj representing the argument. */
-
-    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1 && c->bulklen >= PROTO_MBULK_BIG_ARG) {
-        ssize_t remaining = (size_t)(c->bulklen + 2) - (qblen - c->qb_pos);
-        big_arg = 1;
-
-        /* Note that the 'remaining' variable may be zero in some edge case,
-         * for example once we resume a blocked client after CLIENT PAUSE. */
-        if (remaining > 0) readlen = remaining;
-
-        /* Primary client needs expand the readlen when meet BIG_ARG(see #9100),
-         * but doesn't need align to the next arg, we can read more data. */
-        if (c->flag.primary && readlen < PROTO_IOBUF_LEN) readlen = PROTO_IOBUF_LEN;
-    }
-
-    if (c->querybuf == NULL) {
-        serverAssert(sdslen(thread_shared_qb) == 0);
-        c->querybuf = big_arg ? sdsempty() : thread_shared_qb;
-        qblen = sdslen(c->querybuf);
-    }
-
-    /* c->querybuf may be expanded. If so, the old thread_shared_qb will be released.
-     * Although we have ensured that c->querybuf will not be expanded in the current
-     * thread_shared_qb, we still add this check for code robustness. */
-    int use_thread_shared_qb = (c->querybuf == thread_shared_qb) ? 1 : 0;
-    if (!is_primary && // primary client's querybuf can grow greedy.
-        (big_arg || sdsalloc(c->querybuf) < PROTO_IOBUF_LEN)) {
-        /* When reading a BIG_ARG we won't be reading more than that one arg
-         * into the query buffer, so we don't need to pre-allocate more than we
-         * need, so using the non-greedy growing. For an initial allocation of
-         * the query buffer, we also don't wanna use the greedy growth, in order
-         * to avoid collision with the RESIZE_THRESHOLD mechanism. */
-        c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf, readlen);
-        /* We later set the peak to the used portion of the buffer, but here we over
-         * allocated because we know what we need, make sure it'll not be shrunk before used. */
-        if (c->querybuf_peak < qblen + readlen) c->querybuf_peak = qblen + readlen;
-    } else {
-        c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
-
-        /* Read as much as possible from the socket to save read(2) system calls. */
-        readlen = sdsavail(c->querybuf);
-    }
-    if (use_thread_shared_qb) serverAssert(c->querybuf == thread_shared_qb);
-
-    c->nread = connRead(c->conn, c->querybuf + qblen, readlen);
-    if (c->nread <= 0) {
-        return;
-    }
-
-    sdsIncrLen(c->querybuf, c->nread);
-    qblen = sdslen(c->querybuf);
-    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
-    if (!is_primary) {
-        /* The commands cached in the MULTI/EXEC queue have not been executed yet,
-         * so they are also considered a part of the query buffer in a broader sense.
-         *
-         * For unauthenticated clients, the query buffer cannot exceed 1MB at most. */
-        size_t qb_memory = sdslen(c->querybuf) + c->mstate.argv_len_sums;
-        if (qb_memory > server.client_max_querybuf_len ||
-            (qb_memory > 1024 * 1024 && (c->read_flags & READ_FLAGS_AUTH_REQUIRED))) {
-            c->read_flags |= READ_FLAGS_QB_LIMIT_REACHED;
-        }
-    }
-}
-
-void readQueryFromClient(connection *conn) {
-    client *c = connGetPrivateData(conn);
-    /* Check if we can send the client to be handled by the IO-thread */
-    if (postponeClientRead(c)) return;
-
-    if (c->io_write_state != CLIENT_IDLE || c->io_read_state != CLIENT_IDLE) return;
-
-    readToQueryBuf(c);
-
-    if (handleReadResult(c) == C_OK) {
-        if (processInputBuffer(c) == C_ERR) return;
-    }
-    beforeNextClient(c);
-}
-
-/* An "Address String" is a colon separated ip:port pair.
- * For IPv4 it's in the form x.y.z.k:port, example: "127.0.0.1:1234".
- * For IPv6 addresses we use [] around the IP part, like in "[::1]:1234".
- * For Unix sockets we use path:0, like in "/tmp/redis:0".
- *
- * An Address String always fits inside a buffer of NET_ADDR_STR_LEN bytes,
- * including the null term.
- *
- * On failure the function still populates 'addr' with the "?:0" string in case
- * you want to relax error checking or need to display something anyway (see
- * anetFdToString implementation for more info). */
-void genClientAddrString(client *client, char *addr, size_t addr_len, int remote) {
-    if (client->flag.unix_socket) {
-        /* Unix socket client. */
-        snprintf(addr, addr_len, "%s:0", server.unixsocket);
-    } else {
-        /* TCP client. */
-        connFormatAddr(client->conn, addr, addr_len, remote);
-    }
-}
-
-/* This function returns the client peer id, by creating and caching it
- * if client->peerid is NULL, otherwise returning the cached value.
- * The Peer ID never changes during the life of the client, however it
- * is expensive to compute. */
-char *getClientPeerId(client *c) {
-    char peerid[NET_ADDR_STR_LEN] = {0};
-
-    if (c->peerid == NULL) {
-        genClientAddrString(c, peerid, sizeof(peerid), 1);
-        c->peerid = sdsnew(peerid);
-    }
-    return c->peerid;
-}
-
-/* This function returns the client bound socket name, by creating and caching
- * it if client->sockname is NULL, otherwise returning the cached value.
- * The Socket Name never changes during the life of the client, however it
- * is expensive to compute. */
-char *getClientSockname(client *c) {
-    char sockname[NET_ADDR_STR_LEN] = {0};
-
-    if (c->sockname == NULL) {
-        genClientAddrString(c, sockname, sizeof(sockname), 0);
-        c->sockname = sdsnew(sockname);
-    }
-    return c->sockname;
-}
-
-int isClientConnIpV6(client *c) {
-    /* The cached client peer id is on the form "[IPv6]:port" for IPv6
-     * addresses, so we just check for '[' here. */
-    if (c->flag.fake && server.current_client) {
-        /* Fake client? Use current client instead.
-         * Noted that in here we are assuming server.current_client is set
-         * and real (aof has already violated this in loadSingleAppendOnlyFil). */
-        c = server.current_client;
-    }
-    return getClientPeerId(c)[0] == '[';
 }
 
 /* Concatenate a string representing the state of a client in a human
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
-    if (!server.crashed) waitForClientIO(client);
     char flags[17], events[3], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
@@ -3326,16 +2247,9 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     size_t obufmem, total_mem = getClientMemoryUsage(client, &obufmem);
 
     size_t used_blocks_of_repl_buf = 0;
-    if (client->ref_repl_buf_node) {
-        replBufBlock *last = listNodeValue(listLast(server.repl_buffer_blocks));
-        replBufBlock *cur = listNodeValue(client->ref_repl_buf_node);
-        used_blocks_of_repl_buf = last->id - cur->id + 1;
-    }
     /* clang-format off */
     sds ret = sdscatfmt(s, FMTARGS(
         "id=%U", (unsigned long long) client->id,
-        " addr=%s", getClientPeerId(client),
-        " laddr=%s", getClientSockname(client),
         " %s", connGetInfo(client->conn, conninfo, sizeof(conninfo)),
         " name=%s", hide_user_data ? "*redacted*" : (client->name ? (char*)client->name->ptr : ""),
         " age=%I", (long long)(commandTimeSnapshot() / 1000 - client->ctime),
@@ -3649,8 +2563,6 @@ NULL
     } else if (!strcasecmp(c->argv[1]->ptr, "kill")) {
         /* CLIENT KILL <ip:port>
          * CLIENT KILL <option> [value] ... <option> [value] */
-        char *addr = NULL;
-        char *laddr = NULL;
         user *user = NULL;
         int type = -1;
         uint64_t id = 0;
@@ -3660,7 +2572,6 @@ NULL
 
         if (c->argc == 3) {
             /* Old style syntax: CLIENT KILL <addr> */
-            addr = c->argv[2]->ptr;
             skipme = 0; /* With the old form, you can kill yourself. */
         } else if (c->argc > 3) {
             int i = 2; /* Next option index. */
@@ -3694,16 +2605,6 @@ NULL
                         addReplyErrorFormat(c, "Unknown client type '%s'", (char *)c->argv[i + 1]->ptr);
                         return;
                     }
-                } else if (!strcasecmp(c->argv[i]->ptr, "addr") && moreargs) {
-                    addr = c->argv[i + 1]->ptr;
-                } else if (!strcasecmp(c->argv[i]->ptr, "laddr") && moreargs) {
-                    laddr = c->argv[i + 1]->ptr;
-                } else if (!strcasecmp(c->argv[i]->ptr, "user") && moreargs) {
-                    user = ACLGetUserByName(c->argv[i + 1]->ptr, sdslen(c->argv[i + 1]->ptr));
-                    if (user == NULL) {
-                        addReplyErrorFormat(c, "No such user '%s'", (char *)c->argv[i + 1]->ptr);
-                        return;
-                    }
                 } else if (!strcasecmp(c->argv[i]->ptr, "skipme") && moreargs) {
                     if (!strcasecmp(c->argv[i + 1]->ptr, "yes")) {
                         skipme = 1;
@@ -3728,8 +2629,6 @@ NULL
         listRewind(server.clients, &li);
         while ((ln = listNext(&li)) != NULL) {
             client *client = listNodeValue(ln);
-            if (addr && strcmp(getClientPeerId(client), addr) != 0) continue;
-            if (laddr && strcmp(getClientSockname(client), laddr) != 0) continue;
             if (type != -1 && getClientType(client) != type) continue;
             if (id != 0 && client->id != id) continue;
             if (user && client->user != user) continue;
@@ -3818,149 +2717,6 @@ NULL
 
         if (getTimeoutFromObjectOrReply(c, c->argv[2], &end, UNIT_MILLISECONDS) != C_OK) return;
         pauseClientsByClient(end, isPauseClientAll);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "tracking") && c->argc >= 3) {
-        /* CLIENT TRACKING (on|off) [REDIRECT <id>] [BCAST] [PREFIX first]
-         *                          [PREFIX second] [OPTIN] [OPTOUT] [NOLOOP]... */
-        long long redir = 0;
-        struct ClientFlags options = {0};
-        robj **prefix = NULL;
-        size_t numprefix = 0;
-
-        /* Parse the options. */
-        for (int j = 3; j < c->argc; j++) {
-            int moreargs = (c->argc - 1) - j;
-
-            if (!strcasecmp(c->argv[j]->ptr, "redirect") && moreargs) {
-                j++;
-                if (redir != 0) {
-                    addReplyError(c, "A client can only redirect to a single "
-                                     "other client");
-                    zfree(prefix);
-                    return;
-                }
-
-                if (getLongLongFromObjectOrReply(c, c->argv[j], &redir, NULL) != C_OK) {
-                    zfree(prefix);
-                    return;
-                }
-                /* We will require the client with the specified ID to exist
-                 * right now, even if it is possible that it gets disconnected
-                 * later. Still a valid sanity check. */
-                if (lookupClientByID(redir) == NULL) {
-                    addReplyError(c, "The client ID you want redirect to "
-                                     "does not exist");
-                    zfree(prefix);
-                    return;
-                }
-            } else if (!strcasecmp(c->argv[j]->ptr, "bcast")) {
-                options.tracking_bcast = 1;
-            } else if (!strcasecmp(c->argv[j]->ptr, "optin")) {
-                options.tracking_optin = 1;
-            } else if (!strcasecmp(c->argv[j]->ptr, "optout")) {
-                options.tracking_optout = 1;
-            } else if (!strcasecmp(c->argv[j]->ptr, "noloop")) {
-                options.tracking_noloop = 1;
-            } else if (!strcasecmp(c->argv[j]->ptr, "prefix") && moreargs) {
-                j++;
-                prefix = zrealloc(prefix, sizeof(robj *) * (numprefix + 1));
-                prefix[numprefix++] = c->argv[j];
-            } else {
-                zfree(prefix);
-                addReplyErrorObject(c, shared.syntaxerr);
-                return;
-            }
-        }
-
-        /* Options are ok: enable or disable the tracking for this client. */
-        if (!strcasecmp(c->argv[2]->ptr, "on")) {
-            /* Before enabling tracking, make sure options are compatible
-             * among each other and with the current state of the client. */
-            if (!(options.tracking_bcast) && numprefix) {
-                addReplyError(c, "PREFIX option requires BCAST mode to be enabled");
-                zfree(prefix);
-                return;
-            }
-
-            if (c->flag.tracking) {
-                int oldbcast = !!c->flag.tracking_bcast;
-                int newbcast = !!(options.tracking_bcast);
-                if (oldbcast != newbcast) {
-                    addReplyError(c, "You can't switch BCAST mode on/off before disabling "
-                                     "tracking for this client, and then re-enabling it with "
-                                     "a different mode.");
-                    zfree(prefix);
-                    return;
-                }
-            }
-
-            if (options.tracking_bcast && (options.tracking_optin || options.tracking_optout)) {
-                addReplyError(c, "OPTIN and OPTOUT are not compatible with BCAST");
-                zfree(prefix);
-                return;
-            }
-
-            if (options.tracking_optin && options.tracking_optout) {
-                addReplyError(c, "You can't specify both OPTIN mode and OPTOUT mode");
-                zfree(prefix);
-                return;
-            }
-
-            if ((options.tracking_optin && c->flag.tracking_optout) ||
-                (options.tracking_optout && c->flag.tracking_optin)) {
-                addReplyError(c, "You can't switch OPTIN/OPTOUT mode before disabling "
-                                 "tracking for this client, and then re-enabling it with "
-                                 "a different mode.");
-                zfree(prefix);
-                return;
-            }
-
-            if (options.tracking_bcast) {
-                if (!checkPrefixCollisionsOrReply(c, prefix, numprefix)) {
-                    zfree(prefix);
-                    return;
-                }
-            }
-
-            enableTracking(c, redir, options, prefix, numprefix);
-        } else if (!strcasecmp(c->argv[2]->ptr, "off")) {
-            disableTracking(c);
-        } else {
-            zfree(prefix);
-            addReplyErrorObject(c, shared.syntaxerr);
-            return;
-        }
-        zfree(prefix);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "caching") && c->argc >= 3) {
-        if (!c->flag.tracking) {
-            addReplyError(c, "CLIENT CACHING can be called only when the "
-                             "client is in tracking mode with OPTIN or "
-                             "OPTOUT mode enabled");
-            return;
-        }
-
-        char *opt = c->argv[2]->ptr;
-        if (!strcasecmp(opt, "yes")) {
-            if (c->flag.tracking_optin) {
-                c->flag.tracking_caching = 1;
-            } else {
-                addReplyError(c, "CLIENT CACHING YES is only valid when tracking is enabled in OPTIN mode.");
-                return;
-            }
-        } else if (!strcasecmp(opt, "no")) {
-            if (c->flag.tracking_optout) {
-                c->flag.tracking_caching = 1;
-            } else {
-                addReplyError(c, "CLIENT CACHING NO is only valid when tracking is enabled in OPTOUT mode.");
-                return;
-            }
-        } else {
-            addReplyErrorObject(c, shared.syntaxerr);
-            return;
-        }
-
-        /* Common reply for when we succeeded. */
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "getredir") && c->argc == 2) {
         /* CLIENT GETREDIR */
@@ -4070,19 +2826,11 @@ void helloCommand(client *c) {
         }
     }
 
-    robj *username = NULL;
-    robj *password = NULL;
     robj *clientname = NULL;
     for (int j = next_arg; j < c->argc; j++) {
         int moreargs = (c->argc - 1) - j;
         const char *opt = c->argv[j]->ptr;
-        if (!strcasecmp(opt, "AUTH") && moreargs >= 2) {
-            redactClientCommandArgument(c, j + 1);
-            redactClientCommandArgument(c, j + 2);
-            username = c->argv[j + 1];
-            password = c->argv[j + 2];
-            j += 2;
-        } else if (!strcasecmp(opt, "SETNAME") && moreargs) {
+        if (!strcasecmp(opt, "SETNAME") && moreargs) {
             clientname = c->argv[j + 1];
             const char *err = NULL;
             if (validateClientName(clientname, &err) == C_ERR) {
@@ -4096,41 +2844,18 @@ void helloCommand(client *c) {
         }
     }
 
-    if (username && password) {
-        robj *err = NULL;
-        int auth_result = ACLAuthenticateUser(c, username, password, &err);
-        if (auth_result == AUTH_ERR) {
-            addAuthErrReply(c, err);
-        }
-        if (err) decrRefCount(err);
-        /* In case of auth errors, return early since we already replied with an ERR.
-         * In case of blocking module auth, we reply to the client/setname later upon unblocking. */
-        if (auth_result == AUTH_ERR || auth_result == AUTH_BLOCKED) {
-            return;
-        }
-    }
-
-    /* At this point we need to be authenticated to continue. */
-    if (!c->flag.authenticated) {
-        addReplyError(c, "-NOAUTH HELLO must be called with the client already "
-                         "authenticated, otherwise the HELLO <proto> AUTH <user> <pass> "
-                         "option can be used to authenticate the client and "
-                         "select the RESP protocol version at the same time");
-        return;
-    }
-
     /* Now that we're authenticated, set the client name. */
     if (clientname) clientSetName(c, clientname, NULL);
 
     /* Let's switch to the specified RESP mode. */
     if (ver) c->resp = ver;
-    addReplyMapLen(c, 6 + !server.sentinel_mode);
+    addReplyMapLen(c, 7);
 
     addReplyBulkCString(c, "server");
-    addReplyBulkCString(c, server.extended_redis_compat ? "redis" : SERVER_NAME);
+    addReplyBulkCString(c, SERVER_NAME);
 
     addReplyBulkCString(c, "version");
-    addReplyBulkCString(c, server.extended_redis_compat ? REDIS_VERSION : VALKEY_VERSION);
+    addReplyBulkCString(c, VALKEY_VERSION);
 
     addReplyBulkCString(c, "proto");
     addReplyLongLong(c, c->resp);
@@ -4139,17 +2864,10 @@ void helloCommand(client *c) {
     addReplyLongLong(c, c->id);
 
     addReplyBulkCString(c, "mode");
-    if (server.sentinel_mode)
-        addReplyBulkCString(c, "sentinel");
-    else if (server.cluster_enabled)
-        addReplyBulkCString(c, "cluster");
-    else
-        addReplyBulkCString(c, "standalone");
+    addReplyBulkCString(c, "standalone");
 
-    if (!server.sentinel_mode) {
-        addReplyBulkCString(c, "role");
-        addReplyBulkCString(c, server.primary_host ? "replica" : "master");
-    }
+    addReplyBulkCString(c, "role");
+    addReplyBulkCString(c, "master");
 
     addReplyBulkCString(c, "modules");
     addReplyLoadedModules(c);
@@ -4295,21 +3013,8 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
  * the caller wishes. The main usage of this function currently is
  * enforcing the client output length limits. */
 size_t getClientOutputBufferMemoryUsage(client *c) {
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
-        size_t repl_buf_size = 0;
-        size_t repl_node_num = 0;
-        size_t repl_node_size = sizeof(listNode) + sizeof(replBufBlock);
-        if (c->ref_repl_buf_node) {
-            replBufBlock *last = listNodeValue(listLast(server.repl_buffer_blocks));
-            replBufBlock *cur = listNodeValue(c->ref_repl_buf_node);
-            repl_buf_size = last->repl_offset + last->size - cur->repl_offset;
-            repl_node_num = last->id - cur->id + 1;
-        }
-        return repl_buf_size + (repl_node_size * repl_node_num);
-    } else {
-        size_t list_item_size = sizeof(listNode) + sizeof(clientReplyBlock);
-        return c->reply_bytes + (list_item_size * listLength(c->reply));
-    }
+    size_t list_item_size = sizeof(listNode) + sizeof(clientReplyBlock);
+    return c->reply_bytes + (list_item_size * listLength(c->reply));
 }
 
 /* Returns the total client's memory usage.
@@ -4350,10 +3055,8 @@ size_t getClientMemoryUsage(client *c, size_t *output_buffer_mem_usage) {
  * CLIENT_TYPE_PRIMARY -> The client representing our replication primary.
  */
 int getClientType(client *c) {
-    if (c->flag.primary) return CLIENT_TYPE_PRIMARY;
     /* Even though MONITOR clients are marked as replicas, we
      * want the expose them as normal clients. */
-    if (c->flag.replica && !c->flag.monitor) return CLIENT_TYPE_REPLICA;
     if (c->flag.pubsub) return CLIENT_TYPE_PUBSUB;
     return CLIENT_TYPE_NORMAL;
 }
@@ -4361,14 +3064,8 @@ int getClientType(client *c) {
 int getClientTypeByName(char *name) {
     if (!strcasecmp(name, "normal"))
         return CLIENT_TYPE_NORMAL;
-    else if (!strcasecmp(name, "slave"))
-        return CLIENT_TYPE_REPLICA;
-    else if (!strcasecmp(name, "replica"))
-        return CLIENT_TYPE_REPLICA;
     else if (!strcasecmp(name, "pubsub"))
         return CLIENT_TYPE_PUBSUB;
-    else if (!strcasecmp(name, "master") || !strcasecmp(name, "primary"))
-        return CLIENT_TYPE_PRIMARY;
     else
         return -1;
 }
@@ -4376,9 +3073,7 @@ int getClientTypeByName(char *name) {
 char *getClientTypeName(int class) {
     switch (class) {
     case CLIENT_TYPE_NORMAL: return "normal";
-    case CLIENT_TYPE_REPLICA: return "slave";
     case CLIENT_TYPE_PUBSUB: return "pubsub";
-    case CLIENT_TYPE_PRIMARY: return "master";
     default: return NULL;
     }
 }
@@ -4393,10 +3088,6 @@ int checkClientOutputBufferLimits(client *c) {
     int soft = 0, hard = 0, class;
     unsigned long used_mem = getClientOutputBufferMemoryUsage(c);
 
-    /* For unauthenticated clients which were also never authenticated before the output buffer is limited to prevent
-     * them from abusing it by not reading the replies */
-    if (used_mem > REPLY_BUFFER_SIZE_UNAUTHENTICATED_CLIENT && authRequired(c) && !clientEverAuthenticated(c)) return 1;
-
     class = getClientType(c);
     /* For the purpose of output buffer limiting, primaries are handled
      * like normal clients. */
@@ -4409,8 +3100,6 @@ int checkClientOutputBufferLimits(client *c) {
      * This doesn't have memory consumption implications since the replica client
      * will share the backlog buffers memory. */
     size_t hard_limit_bytes = server.client_obuf_limits[class].hard_limit_bytes;
-    if (class == CLIENT_TYPE_REPLICA && hard_limit_bytes && (long long)hard_limit_bytes < server.repl_backlog_size)
-        hard_limit_bytes = server.repl_backlog_size;
     if (server.client_obuf_limits[class].hard_limit_bytes && used_mem >= hard_limit_bytes) hard = 1;
     if (server.client_obuf_limits[class].soft_limit_bytes &&
         used_mem >= server.client_obuf_limits[class].soft_limit_bytes)
@@ -4454,7 +3143,7 @@ int closeClientOnOutputBufferLimitReached(client *c, int async) {
     serverAssert(c->reply_bytes < SIZE_MAX - (1024 * 64));
     /* Note that c->reply_bytes is irrelevant for replica clients
      * (they use the global repl buffers). */
-    if ((c->reply_bytes == 0 && getClientType(c) != CLIENT_TYPE_REPLICA) ||
+    if ((c->reply_bytes == 0) ||
         (c->flag.close_asap && !(c->flag.protected_rdb_channel)))
         return 0;
     if (checkClientOutputBufferLimits(c)) {
@@ -4628,134 +3317,9 @@ uint32_t isPausedActionsWithUpdate(uint32_t actions_bitmask) {
  *
  * The function returns the total number of events processed. */
 void processEventsWhileBlocked(void) {
-    int iterations = 4; /* See the function top-comment. */
-
     /* Update our cached time since it is used to create and update the last
      * interaction time with clients and for other important things. */
     updateCachedTime(0);
-
-    /* For the few commands that are allowed during busy scripts, we rather
-     * provide a fresher time than the one from when the script started (they
-     * still won't get it from the call due to execution_nesting. For commands
-     * during loading this doesn't matter. */
-    mstime_t prev_cmd_time_snapshot = server.cmd_time_snapshot;
-    server.cmd_time_snapshot = server.mstime;
-
-    /* Note: when we are processing events while blocked (for instance during
-     * busy Lua scripts), we set a global flag. When such flag is set, we
-     * avoid handling the read part of clients using threaded I/O.
-     * See https://github.com/redis/redis/issues/6988 for more info.
-     * Note that there could be cases of nested calls to this function,
-     * specifically on a busy script during async_loading rdb, and scripts
-     * that came from AOF. */
-    ProcessingEventsWhileBlocked++;
-    while (iterations--) {
-        long long startval = server.events_processed_while_blocked;
-        long long ae_events =
-            aeProcessEvents(server.el, AE_FILE_EVENTS | AE_DONT_WAIT | AE_CALL_BEFORE_SLEEP | AE_CALL_AFTER_SLEEP);
-        /* Note that server.events_processed_while_blocked will also get
-         * incremented by callbacks called by the event loop handlers. */
-        server.events_processed_while_blocked += ae_events;
-        long long events = server.events_processed_while_blocked - startval;
-        if (!events) break;
-    }
-
-    whileBlockedCron();
-
-    ProcessingEventsWhileBlocked--;
-    serverAssert(ProcessingEventsWhileBlocked >= 0);
-
-    server.cmd_time_snapshot = prev_cmd_time_snapshot;
-}
-
-/* Return 1 if the client read is handled using threaded I/O.
- * 0 otherwise. */
-int postponeClientRead(client *c) {
-    if (ProcessingEventsWhileBlocked) return 0;
-
-    return (trySendReadToIOThreads(c) == C_OK);
-}
-
-int processIOThreadsReadDone(void) {
-    if (ProcessingEventsWhileBlocked) {
-        /* When ProcessingEventsWhileBlocked we may call processIOThreadsReadDone recursively.
-         * In this case, there may be some clients left in the batch waiting to be processed. */
-        processClientsCommandsBatch();
-    }
-
-    if (listLength(server.clients_pending_io_read) == 0) return 0;
-    int processed = 0;
-    listNode *ln;
-
-    listNode *next = listFirst(server.clients_pending_io_read);
-    while (next) {
-        ln = next;
-        next = listNextNode(ln);
-        client *c = listNodeValue(ln);
-
-        /* Client is still waiting for a pending I/O - skip it */
-        if (c->io_write_state == CLIENT_PENDING_IO || c->io_read_state == CLIENT_PENDING_IO) continue;
-        /* If the write job is done, process it ASAP to free the buffer and handle connection errors */
-        if (c->io_write_state == CLIENT_COMPLETED_IO) {
-            int allow_async_writes = 0; /* Don't send writes for the client to IO threads before processing the reads */
-            processClientIOWriteDone(c, allow_async_writes);
-        }
-        /* memory barrier acquire to get the updated client state */
-        atomic_thread_fence(memory_order_acquire);
-
-        listUnlinkNode(server.clients_pending_io_read, ln);
-        c->flag.pending_read = 0;
-        c->io_read_state = CLIENT_IDLE;
-
-        /* Don't post-process-reads from clients that are going to be closed anyway. */
-        if (c->flag.close_asap) continue;
-
-        /* If a client is protected, don't do anything,
-         * that may trigger read/write error or recreate handler. */
-        if (c->flag.protected) continue;
-
-        processed++;
-        server.stat_io_reads_processed++;
-
-        connSetPostponeUpdateState(c->conn, 0);
-        connUpdateState(c->conn);
-
-        /* On read error - stop here. */
-        if (handleReadResult(c) == C_ERR) {
-            continue;
-        }
-
-        if (!(c->read_flags & READ_FLAGS_DONT_PARSE)) {
-            parseResult res = handleParseResults(c);
-            /* On parse error - stop here. */
-            if (res == PARSE_ERR) {
-                continue;
-            } else if (res == PARSE_NEEDMORE) {
-                beforeNextClient(c);
-                continue;
-            }
-        }
-
-        if (c->argc > 0) {
-            c->flag.pending_command = 1;
-        }
-
-        size_t list_length_before_command_execute = listLength(server.clients_pending_io_read);
-        /* try to add the command to the batch */
-        int ret = addCommandToBatchAndProcessIfFull(c);
-        /* If the command was not added to the commands batch, process it immediately */
-        if (ret == C_ERR) {
-            if (processPendingCommandAndInputBuffer(c) == C_OK) beforeNextClient(c);
-        }
-        if (list_length_before_command_execute != listLength(server.clients_pending_io_read)) {
-            /* A client was unlink from the list possibly making the next node invalid */
-            next = listFirst(server.clients_pending_io_read);
-        }
-    }
-
-    processClientsCommandsBatch();
-
-    return processed;
 }
 
 /* Returns the actual client eviction limit based on current configuration or
@@ -4807,75 +3371,4 @@ void evictClients(void) {
             listRewind(server.client_mem_usage_buckets[curr_bucket].clients, &bucket_iter);
         }
     }
-}
-
-/* IO threads functions */
-
-void ioThreadReadQueryFromClient(void *data) {
-    client *c = data;
-    serverAssert(c->io_read_state == CLIENT_PENDING_IO);
-
-    /* Read */
-    readToQueryBuf(c);
-
-    /* Check for read errors. */
-    if (c->nread <= 0) {
-        goto done;
-    }
-
-    /* Skip command parsing if the READ_FLAGS_DONT_PARSE flag is set. */
-    if (c->read_flags & READ_FLAGS_DONT_PARSE) {
-        goto done;
-    }
-
-    /* Handle QB limit */
-    if (c->read_flags & READ_FLAGS_QB_LIMIT_REACHED) {
-        goto done;
-    }
-
-    parseCommand(c);
-
-    /* Parsing was not completed - let the main-thread handle it. */
-    if (!(c->read_flags & READ_FLAGS_PARSING_COMPLETED)) {
-        goto done;
-    }
-
-    /* Empty command - Multibulk processing could see a <= 0 length. */
-    if (c->argc == 0) {
-        goto done;
-    }
-
-    /* Lookup command offload */
-    c->io_parsed_cmd = lookupCommand(c->argv, c->argc);
-    if (c->io_parsed_cmd && commandCheckArity(c->io_parsed_cmd, c->argc, NULL) == 0) {
-        /* The command was found, but the arity is invalid.
-         * In this case, we reset the parsed_cmd and will let the main thread handle it. */
-        c->io_parsed_cmd = NULL;
-    }
-
-    /* Offload slot calculations to the I/O thread to reduce main-thread load. */
-    if (c->io_parsed_cmd && server.cluster_enabled) {
-        getKeysResult result;
-        initGetKeysResult(&result);
-        int numkeys = getKeysFromCommand(c->io_parsed_cmd, c->argv, c->argc, &result);
-        if (numkeys) {
-            robj *first_key = c->argv[result.keys[0].pos];
-            c->slot = keyHashSlot(first_key->ptr, sdslen(first_key->ptr));
-        }
-        getKeysFreeResult(&result);
-    }
-
-done:
-    trimClientQueryBuffer(c);
-    atomic_thread_fence(memory_order_release);
-    c->io_read_state = CLIENT_COMPLETED_IO;
-}
-
-void ioThreadWriteToClient(void *data) {
-    client *c = data;
-    serverAssert(c->io_write_state == CLIENT_PENDING_IO);
-    c->nwritten = 0;
-    _writeToClient(c);
-    atomic_thread_fence(memory_order_release);
-    c->io_write_state = CLIENT_COMPLETED_IO;
 }

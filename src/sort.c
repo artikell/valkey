@@ -32,7 +32,6 @@
 #include "server.h"
 #include "pqsort.h" /* Partial qsort for SORT+LIMIT */
 #include <math.h>   /* isnan() */
-#include "cluster.h"
 
 zskiplistNode *zslGetElementByRank(zskiplist *zsl, unsigned long rank);
 
@@ -210,9 +209,6 @@ void sortCommandGeneric(client *c, int readonly) {
     listSetFreeMethod(operations, zfree);
     j = 2; /* options start at argv[2] */
 
-    user_has_full_key_access =
-        ACLUserCheckCmdWithUnrestrictedKeyAccess(c->user, c->cmd, c->argv, c->argc, CMD_KEY_ACCESS);
-
     /* The SORT command has an SQL-alike syntax, parse it */
     while (j < c->argc) {
         int leftargs = c->argc - j - 1;
@@ -239,16 +235,6 @@ void sortCommandGeneric(client *c, int readonly) {
             if (strchr(c->argv[j + 1]->ptr, '*') == NULL) {
                 dontsort = 1;
             } else {
-                /* If BY is specified with a real pattern, we can't accept it in cluster mode,
-                 * unless we can make sure the keys formed by the pattern are in the same slot
-                 * as the key to sort. */
-                if (server.cluster_enabled &&
-                    patternHashSlot(sortby->ptr, sdslen(sortby->ptr)) != getKeySlot(c->argv[1]->ptr)) {
-                    addReplyError(c, "BY option of SORT denied in Cluster mode when "
-                                     "keys formed by the pattern may be in different slots.");
-                    syntax_error++;
-                    break;
-                }
                 /* If BY is specified with a real pattern, we can't accept
                  * it if no full ACL key access is applied for this command. */
                 if (!user_has_full_key_access) {
@@ -259,17 +245,6 @@ void sortCommandGeneric(client *c, int readonly) {
             }
             j++;
         } else if (!strcasecmp(c->argv[j]->ptr, "get") && leftargs >= 1) {
-            /* If GET is specified with a real pattern, we can't accept it in cluster mode,
-             * unless we can make sure the keys formed by the pattern are in the same slot
-             * as the key to sort. */
-            if (server.cluster_enabled && !isReturnSubstPattern(c->argv[j + 1]->ptr) &&
-                !isReturnSubstPattern(c->argv[j + 1]->ptr) &&
-                patternHashSlot(c->argv[j + 1]->ptr, sdslen(c->argv[j + 1]->ptr)) != getKeySlot(c->argv[1]->ptr)) {
-                addReplyError(c, "GET option of SORT denied in Cluster mode when "
-                                 "keys formed by the pattern may be in different slots.");
-                syntax_error++;
-                break;
-            }
             if (!user_has_full_key_access) {
                 addReplyError(c, "GET option of SORT denied due to insufficient ACL permissions.");
                 syntax_error++;

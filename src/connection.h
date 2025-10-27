@@ -36,8 +36,6 @@
 #include <string.h>
 #include <sys/uio.h>
 
-#include "ae.h"
-
 #define CONN_INFO_LEN 32
 #define CONN_ADDR_STR_LEN 128 /* Similar to INET6_ADDRSTRLEN, hoping to handle other protocols. */
 
@@ -74,8 +72,8 @@ typedef struct ConnectionType {
     int (*configure)(void *priv, int reconfigure);
 
     /* ae & accept & listen & error & address handler */
-    void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
-    aeFileProc *accept_handler;
+    // void (*ae_handler)(struct aeEventLoop *el, int fd, void *clientData, int mask);
+    // aeFileProc *accept_handler;
     int (*addr)(connection *conn, char *ip, size_t ip_len, int *port, int remote);
     int (*is_local)(connection *conn);
     int (*listen)(connListener *listener);
@@ -372,15 +370,6 @@ static inline const char *connGetInfo(connection *conn, char *buf, size_t buf_le
     return buf;
 }
 
-/* anet-style wrappers to conns */
-int connBlock(connection *conn);
-int connNonBlock(connection *conn);
-int connEnableTcpNoDelay(connection *conn);
-int connDisableTcpNoDelay(connection *conn);
-int connKeepAlive(connection *conn, int interval);
-int connSendTimeout(connection *conn, long long ms);
-int connRecvTimeout(connection *conn, long long ms);
-
 /* Get cert for the secure connection */
 static inline sds connGetPeerCert(connection *conn) {
     if (conn->type->get_peer_cert) {
@@ -442,19 +431,6 @@ int connTypeProcessPendingData(void);
 static inline int connListen(connListener *listener) {
     return listener->ct->listen(listener);
 }
-
-/* Get accept_handler of a connection type */
-static inline aeFileProc *connAcceptHandler(ConnectionType *ct) {
-    if (ct) return ct->accept_handler;
-    return NULL;
-}
-
-/* Get Listeners information, note that caller should free the non-empty string */
-sds getListensInfoString(sds info);
-
-int RedisRegisterConnectionTypeSocket(void);
-int RedisRegisterConnectionTypeUnix(void);
-int RedisRegisterConnectionTypeTLS(void);
 
 /* Return 1 if connection is using TLS protocol, 0 if otherwise. */
 static inline int connIsTLS(connection *conn) {

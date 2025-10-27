@@ -353,10 +353,6 @@ void activeExpireCycle(int type) {
         } while (repeat);
     }
 
-    elapsed = ustime() - start;
-    server.stat_expire_cycle_time_used += elapsed;
-    latencyAddSampleIfNeeded("expire-cycle", elapsed / 1000);
-
     /* Update our estimate of keys existing but yet to be expired.
      * Running average with this sample accounting for 5%. */
     double current_perc;
@@ -522,7 +518,7 @@ int checkAlreadyExpired(long long when) {
      *
      * Instead we add the already expired key to the database with expire time
      * (possibly in the past) and wait for an explicit DEL from the primary. */
-    return (when <= commandTimeSnapshot() && !server.loading && !server.primary_host);
+    return (when <= commandTimeSnapshot());
 }
 
 #define EXPIRE_NX (1 << 0)

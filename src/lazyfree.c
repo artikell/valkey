@@ -1,7 +1,6 @@
 #include "server.h"
 #include "bio.h"
 #include "functions.h"
-#include "cluster.h"
 
 #include <stdatomic.h>
 
@@ -35,7 +34,6 @@ void lazyfreeFreeDatabase(void *args[]) {
 void lazyFreeTrackingTable(void *args[]) {
     rax *rt = args[0];
     size_t len = rt->numele;
-    freeTrackingRadixTree(rt);
     atomic_fetch_sub_explicit(&lazyfree_objects, len, memory_order_relaxed);
     atomic_fetch_add_explicit(&lazyfreed_objects, len, memory_order_relaxed);
 }
@@ -187,27 +185,11 @@ void freeObjAsync(robj *key, robj *obj, int dbid) {
 void emptyDbAsync(serverDb *db) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_DICTS_ON_DEMAND;
-    if (server.cluster_enabled) {
-        slot_count_bits = CLUSTER_SLOT_MASK_BITS;
-        flags |= KVSTORE_FREE_EMPTY_DICTS;
-    }
     kvstore *oldkeys = db->keys, *oldexpires = db->expires;
     db->keys = kvstoreCreate(&kvstoreKeysDictType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreExpiresDictType, slot_count_bits, flags);
     atomic_fetch_add_explicit(&lazyfree_objects, kvstoreSize(oldkeys), memory_order_relaxed);
     bioCreateLazyFreeJob(lazyfreeFreeDatabase, 2, oldkeys, oldexpires);
-}
-
-/* Free the key tracking table.
- * If the table is huge enough, free it in async way. */
-void freeTrackingRadixTreeAsync(rax *tracking) {
-    /* Because this rax has only keys and no values so we use numnodes. */
-    if (tracking->numnodes > LAZYFREE_THRESHOLD) {
-        atomic_fetch_add_explicit(&lazyfree_objects, tracking->numele, memory_order_relaxed);
-        bioCreateLazyFreeJob(lazyFreeTrackingTable, 1, tracking);
-    } else {
-        freeTrackingRadixTree(tracking);
-    }
 }
 
 /* Free the error stats rax tree.

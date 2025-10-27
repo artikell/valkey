@@ -214,10 +214,6 @@ void *bioProcessBackgroundJobs(void *arg) {
 
     valkey_set_thread_title(bio_worker_title[worker]);
 
-    serverSetCpuAffinity(server.bio_cpulist);
-
-    makeThreadKillable();
-
     pthread_mutex_lock(&bio_mutex[worker]);
     /* Block SIGALRM so we are sure that only the main thread will
      * receive the watchdog signal. */
@@ -260,16 +256,7 @@ void *bioProcessBackgroundJobs(void *arg) {
              * socket, pipe, or file. We just ignore these errno because
              * aof fsync did not really fail. */
             if (valkey_fsync(job->fd_args.fd) == -1 && errno != EBADF && errno != EINVAL) {
-                int last_status = atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_relaxed);
-
-                atomic_store_explicit(&server.aof_bio_fsync_errno, errno, memory_order_relaxed);
-                atomic_store_explicit(&server.aof_bio_fsync_status, C_ERR, memory_order_release);
-                if (last_status == C_OK) {
-                    serverLog(LL_WARNING, "Fail to fsync the AOF file: %s", strerror(errno));
-                }
-            } else {
-                atomic_store_explicit(&server.aof_bio_fsync_status, C_OK, memory_order_relaxed);
-                atomic_store_explicit(&server.fsynced_reploff_pending, job->fd_args.offset, memory_order_relaxed);
+                serverLog(LL_WARNING, "Fail to fsync the AOF file: %s", strerror(errno));
             }
 
             if (job->fd_args.need_reclaim_cache) {

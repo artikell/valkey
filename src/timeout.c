@@ -27,7 +27,6 @@
  */
 
 #include "server.h"
-#include "cluster.h"
 
 #include <math.h>
 
@@ -63,12 +62,6 @@ int clientsCronHandleTimeout(client *c, mstime_t now_ms) {
         serverLog(LL_VERBOSE, "Closing idle client");
         freeClient(c);
         return 1;
-    } else if (c->flag.blocked) {
-        /* Cluster: handle unblock & redirect of clients blocked
-         * into keys no longer served by this server. */
-        if (server.cluster_enabled) {
-            if (clusterRedirectBlockedClientIfNeeded(c)) unblockClientOnError(c, NULL);
-        }
     }
     return 0;
 }

@@ -38,7 +38,6 @@
 #include "server.h"
 #include "sha1.h"
 #include "rand.h"
-#include "cluster.h"
 #include "monotonic.h"
 #include "resp_parser.h"
 #include "script_lua.h"
@@ -630,9 +629,6 @@ void evalGenericCommand(client *c, int evalsha) {
 }
 
 void evalCommand(client *c) {
-    /* Explicitly feed monitor here so that lua commands appear after their
-     * script command. */
-    replicationFeedMonitors(c, server.monitors, c->db->id, c->argv, c->argc);
     if (!c->flag.lua_debug)
         evalGenericCommand(c, 0);
     else
@@ -644,9 +640,6 @@ void evalRoCommand(client *c) {
 }
 
 void evalShaCommand(client *c) {
-    /* Explicitly feed monitor here so that lua commands appear after their
-     * script command. */
-    replicationFeedMonitors(c, server.monitors, c->db->id, c->argv, c->argc);
     if (sdslen(c->argv[1]->ptr) != 40) {
         /* We know that a match is not possible if the provided SHA is
          * not the right length. So we return an error ASAP, this way
@@ -876,37 +869,9 @@ void ldbSendLogs(void) {
  * returned 1. */
 int ldbStartSession(client *c) {
     ldb.forked = !c->flag.lua_debug_sync;
-    if (ldb.forked) {
-        pid_t cp = serverFork(CHILD_TYPE_LDB);
-        if (cp == -1) {
-            addReplyErrorFormat(c, "Fork() failed: can't run EVAL in debugging mode: %s", strerror(errno));
-            return 0;
-        } else if (cp == 0) {
-            /* Child. Let's ignore important signals handled by the parent. */
-            struct sigaction act;
-            sigemptyset(&act.sa_mask);
-            act.sa_flags = 0;
-            act.sa_handler = SIG_IGN;
-            sigaction(SIGTERM, &act, NULL);
-            sigaction(SIGINT, &act, NULL);
-
-            /* Log the creation of the child and close the listening
-             * socket to make sure if the parent crashes a reset is sent
-             * to the clients. */
-            serverLog(LL_NOTICE, "%s forked for debugging eval", SERVER_TITLE);
-        } else {
-            /* Parent */
-            listAddNodeTail(ldb.children, (void *)(unsigned long)cp);
-            freeClientAsync(c); /* Close the client in the parent side. */
-            return 0;
-        }
-    } else {
-        serverLog(LL_NOTICE, "%s synchronous debugging eval session started", SERVER_TITLE);
-    }
+    serverLog(LL_NOTICE, "%s synchronous debugging eval session started", SERVER_TITLE);
 
     /* Setup our debugging session. */
-    connBlock(ldb.conn);
-    connSendTimeout(ldb.conn, 5000);
     ldb.active = 1;
 
     /* First argument of EVAL is the script itself. We split it into different
@@ -937,10 +902,6 @@ void ldbEndSession(client *c) {
     } else {
         serverLog(LL_NOTICE, "%s synchronous debugging eval session ended", SERVER_TITLE);
     }
-
-    /* Otherwise let's restore client's state. */
-    connNonBlock(ldb.conn);
-    connSendTimeout(ldb.conn, 0);
 
     /* Close the client connection after sending the final EVAL reply
      * in order to signal the end of the debugging session. */

@@ -28,11 +28,8 @@
  */
 
 #include "server.h"
-#include "cluster.h"
-#include "latency.h"
 #include "script.h"
 #include "functions.h"
-#include "io_threads.h"
 
 #include <signal.h>
 #include <ctype.h>
@@ -109,9 +106,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
          * It's possible that the WRITE flag is set even during a readonly
          * command, since the command may trigger events that cause modules to
          * perform additional writes. */
-        int is_ro_replica = server.primary_host && server.repl_replica_ro;
         int expire_flags = 0;
-        if (flags & LOOKUP_WRITE && !is_ro_replica) expire_flags |= EXPIRE_FORCE_DELETE_EXPIRED;
         if (flags & LOOKUP_NOEXPIRE) expire_flags |= EXPIRE_AVOID_DELETE_EXPIRED;
         if (expireIfNeeded(db, key, expire_flags) != KEY_VALID) {
             /* The key is no longer valid. */
@@ -126,7 +121,7 @@ robj *lookupKey(serverDb *db, robj *key, int flags) {
         if (server.current_client && server.current_client->flag.no_touch &&
             server.executing_client->cmd->proc != touchCommand)
             flags |= LOOKUP_NOTOUCH;
-        if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)) {
+        if (!(flags & LOOKUP_NOTOUCH)) {
             if (!canUseSharedObject() && val->refcount == OBJ_SHARED_REFCOUNT) {
                 val = dupStringObject(val);
                 kvstoreDictSetVal(db->keys, getKVStoreIndexForKey(key->ptr), de, val);
@@ -225,38 +220,15 @@ void dbAdd(serverDb *db, robj *key, robj *val) {
 
 /* Returns which dict index should be used with kvstore for a given key. */
 static int getKVStoreIndexForKey(sds key) {
-    return server.cluster_enabled ? getKeySlot(key) : 0;
+    return 0;
 }
 
 /* Returns the cluster hash slot for a given key, trying to use the cached slot that
  * stored on the server.current_client first. If there is no cached value, it will compute the hash slot
  * and then cache the value.*/
 int getKeySlot(sds key) {
-    serverAssert(server.cluster_enabled);
-    /* This is performance optimization that uses pre-set slot id from the current command,
-     * in order to avoid calculation of the key hash.
-     *
-     * This optimization is only used when current_client flag `CLIENT_EXECUTING_COMMAND` is set.
-     * It only gets set during the execution of command under `call` method. Other flows requesting
-     * the key slot would fallback to keyHashSlot.
-     *
-     * Modules and scripts executed on the primary may get replicated as multi-execs that operate on multiple slots,
-     * so we must always recompute the slot for commands coming from the primary.
-     */
-    if (server.current_client && server.current_client->slot >= 0 && server.current_client->flag.executing_command &&
-        !server.current_client->flag.primary) {
-        debugServerAssertWithInfo(server.current_client, NULL,
-                                  (int)keyHashSlot(key, (int)sdslen(key)) == server.current_client->slot);
-        return server.current_client->slot;
-    }
-    int slot = keyHashSlot(key, (int)sdslen(key));
-    /* For the case of replicated commands from primary, getNodeByQuery() never gets called,
-     * and thus c->slot never gets populated. That said, if this command ends up accessing a key,
-     * we are able to backfill c->slot here, where the key's hash calculation is made. */
-    if (server.current_client && server.current_client->flag.primary) {
-        server.current_client->slot = slot;
-    }
-    return slot;
+    serverAssert(0);
+    return -1;
 }
 
 /* This is a special version of dbAdd() that is used only when loading
@@ -316,9 +288,7 @@ static void dbSetValue(serverDb *db, robj *key, robj *val, int overwrite, dictEn
     }
     kvstoreDictSetVal(db->keys, dict_index, de, val);
     /* For efficiency, let the I/O thread that allocated an object also deallocate it. */
-    if (tryOffloadFreeObjToIOThreads(old) == C_OK) {
-        /* OK */
-    } else if (server.lazyfree_lazy_server_del) {
+    if (server.lazyfree_lazy_server_del) {
         freeObjAsync(key, old, db->id);
     } else {
         decrRefCount(old);
@@ -372,7 +342,6 @@ void setKey(client *c, serverDb *db, robj *key, robj *val, int flags) {
  * The function makes sure to return keys not already expired. */
 robj *dbRandomKey(serverDb *db) {
     dictEntry *de;
-    int maxtries = 100;
     int allvolatile = kvstoreSize(db->keys) == kvstoreSize(db->expires);
 
     while (1) {
@@ -385,17 +354,6 @@ robj *dbRandomKey(serverDb *db) {
         key = dictGetKey(de);
         keyobj = createStringObject(key, sdslen(key));
         if (dbFindExpiresWithDictIndex(db, key, randomDictIndex)) {
-            if (allvolatile && (server.primary_host || isPausedActions(PAUSE_ACTION_EXPIRE)) && --maxtries == 0) {
-                /* If the DB is composed only of keys with an expire set,
-                 * it could happen that all the keys are already logically
-                 * expired in the repilca, so the function cannot stop because
-                 * expireIfNeeded() is false, nor it can stop because
-                 * dictGetFairRandomKey() returns NULL (there are keys to return).
-                 * To prevent the infinite loop we do some tries, but if there
-                 * are the conditions for an infinite loop, eventually we
-                 * return a key name that may be already expired. */
-                return keyobj;
-            }
             if (expireIfNeededWithDictIndex(db, keyobj, 0, randomDictIndex) != KEY_VALID) {
                 decrRefCount(keyobj);
                 continue; /* search for another key. This expired. */
@@ -586,10 +544,6 @@ long long emptyData(int dbnum, int flags, void(callback)(dict *)) {
 serverDb *initTempDb(void) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_DICTS_ON_DEMAND;
-    if (server.cluster_enabled) {
-        slot_count_bits = CLUSTER_SLOT_MASK_BITS;
-        flags |= KVSTORE_FREE_EMPTY_DICTS;
-    }
     serverDb *tempDb = zcalloc(sizeof(serverDb) * server.dbnum);
     for (int i = 0; i < server.dbnum; i++) {
         tempDb[i].id = i;
@@ -642,7 +596,6 @@ long long dbTotalServerKeyCount(void) {
  * a context of a client. */
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
     touchWatchedKey(db, key);
-    trackingInvalidateKey(c, key, 1);
 }
 
 void signalFlushedDb(int dbid, int async) {
@@ -658,8 +611,6 @@ void signalFlushedDb(int dbid, int async) {
         scanDatabaseForDeletedKeys(&server.db[j], NULL);
         touchAllWatchedKeysInDb(&server.db[j], NULL);
     }
-
-    trackingInvalidateKeysOnFlush(async);
 
     /* Changes in this method may take place in swapMainDbWithTempDb as well,
      * where we execute similar calls, but with subtle differences as it's
@@ -697,13 +648,6 @@ int getFlushCommandFlags(client *c, int *flags) {
 /* Flushes the whole server data set. */
 void flushAllDataAndResetRDB(int flags) {
     server.dirty += emptyData(-1, flags, NULL);
-    if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
-    if (server.saveparamslen > 0) {
-        rdbSaveInfo rsi, *rsiptr;
-        rsiptr = rdbPopulateSaveInfo(&rsi);
-        rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE);
-    }
-
 #if defined(USE_JEMALLOC)
     /* jemalloc 5 doesn't release pages back to the OS when there's no traffic.
      * for large databases, flushdb blocks for long anyway, so a bit more won't
@@ -793,11 +737,6 @@ void selectCommand(client *c) {
     int id;
 
     if (getIntFromObjectOrReply(c, c->argv[1], &id, NULL) != C_OK) return;
-
-    if (server.cluster_enabled && id != 0) {
-        addReplyError(c, "SELECT is not allowed in cluster mode");
-        return;
-    }
     if (selectDb(c, id) == C_ERR) {
         addReplyError(c, "DB index is out of range");
     } else {
@@ -824,9 +763,6 @@ void keysCommand(client *c) {
     unsigned long numkeys = 0;
     void *replylen = addReplyDeferredLen(c);
     allkeys = (pattern[0] == '*' && plen == 1);
-    if (server.cluster_enabled && !allkeys) {
-        pslot = patternHashSlot(pattern, plen);
-    }
     kvstoreDictIterator *kvs_di = NULL;
     kvstoreIterator *kvs_it = NULL;
     if (pslot != -1) {
@@ -1123,9 +1059,6 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor) {
 
         /* A pattern may restrict all matching keys to one cluster slot. */
         int onlydidx = -1;
-        if (o == NULL && use_pattern && server.cluster_enabled) {
-            onlydidx = patternHashSlot(pat, patlen);
-        }
         do {
             /* In cluster mode there is a separate dictionary for each slot.
              * If cursor is empty, we should try exploring next non-empty slot. */
@@ -1222,74 +1155,10 @@ void dbsizeCommand(client *c) {
     addReplyLongLong(c, kvstoreSize(c->db->keys));
 }
 
-void lastsaveCommand(client *c) {
-    addReplyLongLong(c, server.lastsave);
-}
-
 void typeCommand(client *c) {
     robj *o;
     o = lookupKeyReadWithFlags(c->db, c->argv[1], LOOKUP_NOTOUCH);
     addReplyStatus(c, getObjectTypeName(o));
-}
-
-/* SHUTDOWN [[NOSAVE | SAVE] [NOW] [FORCE] | ABORT] */
-void shutdownCommand(client *c) {
-    int flags = SHUTDOWN_NOFLAGS;
-    int abort = 0;
-    for (int i = 1; i < c->argc; i++) {
-        if (!strcasecmp(c->argv[i]->ptr, "nosave")) {
-            flags |= SHUTDOWN_NOSAVE;
-        } else if (!strcasecmp(c->argv[i]->ptr, "save")) {
-            flags |= SHUTDOWN_SAVE;
-        } else if (!strcasecmp(c->argv[i]->ptr, "now")) {
-            flags |= SHUTDOWN_NOW;
-        } else if (!strcasecmp(c->argv[i]->ptr, "force")) {
-            flags |= SHUTDOWN_FORCE;
-        } else if (!strcasecmp(c->argv[i]->ptr, "abort")) {
-            abort = 1;
-        } else {
-            addReplyErrorObject(c, shared.syntaxerr);
-            return;
-        }
-    }
-    if ((abort && flags != SHUTDOWN_NOFLAGS) || (flags & SHUTDOWN_NOSAVE && flags & SHUTDOWN_SAVE)) {
-        /* Illegal combo. */
-        addReplyErrorObject(c, shared.syntaxerr);
-        return;
-    }
-
-    if (abort) {
-        if (abortShutdown() == C_OK)
-            addReply(c, shared.ok);
-        else
-            addReplyError(c, "No shutdown in progress.");
-        return;
-    }
-
-    if (!(flags & SHUTDOWN_NOW) && c->flag.deny_blocking) {
-        addReplyError(c, "SHUTDOWN without NOW or ABORT isn't allowed for DENY BLOCKING client");
-        return;
-    }
-
-    if (!(flags & SHUTDOWN_NOSAVE) && isInsideYieldingLongCommand()) {
-        /* Script timed out. Shutdown allowed only with the NOSAVE flag. See
-         * also processCommand where these errors are returned. */
-        if (server.busy_module_yield_flags && server.busy_module_yield_reply) {
-            addReplyErrorFormat(c, "-BUSY %s", server.busy_module_yield_reply);
-        } else if (server.busy_module_yield_flags) {
-            addReplyErrorObject(c, shared.slowmoduleerr);
-        } else if (scriptIsEval()) {
-            addReplyErrorObject(c, shared.slowevalerr);
-        } else {
-            addReplyErrorObject(c, shared.slowscripterr);
-        }
-        return;
-    }
-
-    blockClientShutdown(c);
-    if (prepareForShutdown(c, flags) == C_OK) exit(0);
-    /* If we're here, then shutdown is ongoing (the client is still blocked) or
-     * failed (the client has received an error). */
 }
 
 void renameGenericCommand(client *c, int nx) {
@@ -1344,11 +1213,6 @@ void moveCommand(client *c) {
     serverDb *src, *dst;
     int srcid, dbid;
     long long expire;
-
-    if (server.cluster_enabled) {
-        addReplyError(c, "MOVE is not allowed in cluster mode");
-        return;
-    }
 
     /* Obtain source and target DB pointers */
     src = c->db;
@@ -1430,11 +1294,6 @@ void copyCommand(client *c) {
             addReplyErrorObject(c, shared.syntaxerr);
             return;
         }
-    }
-
-    if ((server.cluster_enabled == 1) && (srcid != 0 || dbid != 0)) {
-        addReplyError(c, "Copying to another database is not allowed in cluster mode");
-        return;
     }
 
     /* If the user select the same DB as
@@ -1637,19 +1496,12 @@ void swapMainDbWithTempDb(serverDb *tempDb) {
         scanDatabaseForReadyKeys(activedb);
     }
 
-    trackingInvalidateKeysOnFlush(1);
     flushReplicaKeysWithExpireList();
 }
 
 /* SWAPDB db1 db2 */
 void swapdbCommand(client *c) {
     int id1, id2;
-
-    /* Not allowed in cluster mode: we have just DB 0 there. */
-    if (server.cluster_enabled) {
-        addReplyError(c, "SWAPDB is not allowed in cluster mode");
-        return;
-    }
 
     /* Get the two DBs indexes. */
     if (getIntFromObjectOrReply(c, c->argv[1], &id1, "invalid first DB index") != C_OK) return;
@@ -1693,9 +1545,6 @@ void setExpire(client *c, serverDb *db, robj *key, long long when) {
     } else {
         dictSetSignedIntegerVal(de, when);
     }
-
-    int writable_replica = server.primary_host && server.repl_replica_ro == 0;
-    if (c && writable_replica && !c->flag.primary) rememberReplicaKeyWithExpire(db, key);
 }
 
 /* Return the expire time of the specified key, or -1 if no expire
@@ -1716,11 +1565,7 @@ long long getExpire(serverDb *db, robj *key) {
 }
 
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index) {
-    mstime_t expire_latency;
-    latencyStartMonitor(expire_latency);
     dbGenericDeleteWithDictIndex(db, keyobj, server.lazyfree_lazy_expire, DB_FLAG_KEY_EXPIRED, dict_index);
-    latencyEndMonitor(expire_latency);
-    latencyAddSampleIfNeeded("expire-del", expire_latency);
     notifyKeyspaceEvent(NOTIFY_EXPIRED, "expired", keyobj, db->id);
     signalModifiedKey(NULL, db, keyobj);
     propagateDeletion(db, keyobj, server.lazyfree_lazy_expire);
@@ -1810,24 +1655,6 @@ keyStatus expireIfNeededWithDictIndex(serverDb *db, robj *key, int flags, int di
     if (server.lazy_expire_disabled) return KEY_VALID;
     if (!keyIsExpiredWithDictIndex(db, key, dict_index)) return KEY_VALID;
 
-    /* If we are running in the context of a replica, instead of
-     * evicting the expired key from the database, we return ASAP:
-     * the replica key expiration is controlled by the primary that will
-     * send us synthesized DEL operations for expired keys. The
-     * exception is when write operations are performed on writable
-     * replicas.
-     *
-     * Still we try to return the right information to the caller,
-     * that is, KEY_VALID if we think the key should still be valid,
-     * KEY_EXPIRED if we think the key is expired but don't want to delete it at this time.
-     *
-     * When replicating commands from the primary, keys are never considered
-     * expired. */
-    if (server.primary_host != NULL) {
-        if (server.current_client && (server.current_client->flag.primary)) return KEY_VALID;
-        if (!(flags & EXPIRE_FORCE_DELETE_EXPIRED)) return KEY_EXPIRED;
-    }
-
     /* In some cases we're explicitly instructed to return an indication of a
      * missing key without actually deleting it, even on primaries. */
     if (flags & EXPIRE_AVOID_DELETE_EXPIRED) return KEY_EXPIRED;
@@ -1885,13 +1712,6 @@ keyStatus expireIfNeeded(serverDb *db, robj *key, int flags) {
     return expireIfNeededWithDictIndex(db, key, flags, dict_index);
 }
 
-/* CB passed to kvstoreExpand.
- * The purpose is to skip expansion of unused dicts in cluster mode (all
- * dicts not mapped to *my* slots) */
-static int dbExpandSkipSlot(int slot) {
-    return !clusterNodeCoversSlot(clusterNodeGetPrimary(getMyClusterNode()), slot);
-}
-
 /*
  * This functions increases size of the main/expires db to match desired number.
  * In cluster mode resizes all individual dictionaries for slots that this node owns.
@@ -1904,16 +1724,7 @@ static int dbExpandSkipSlot(int slot) {
  */
 static int dbExpandGeneric(kvstore *kvs, uint64_t db_size, int try_expand) {
     int ret;
-    if (server.cluster_enabled) {
-        /* We don't know exact number of keys that would fall into each slot, but we can
-         * approximate it, assuming even distribution, divide it by the number of slots. */
-        int slots = getMyShardSlotCount();
-        if (slots == 0) return C_OK;
-        db_size = db_size / slots;
-        ret = kvstoreExpand(kvs, db_size, try_expand, dbExpandSkipSlot);
-    } else {
-        ret = kvstoreExpand(kvs, db_size, try_expand, NULL);
-    }
+    ret = kvstoreExpand(kvs, db_size, try_expand, NULL);
 
     return ret ? C_OK : C_ERR;
 }
@@ -2091,7 +1902,7 @@ int getKeysUsingKeySpecs(struct serverCommand *cmd, robj **argv, int argc, int s
                 } else {
                     serverPanic("%s built-in command declared keys positions"
                                 " not matching the arity requirements.",
-                                server.extended_redis_compat ? "Redis" : "Valkey");
+                                "Valkey");
                 }
             }
             keys[result->numkeys].pos = i;
@@ -2286,7 +2097,7 @@ int getKeysUsingLegacyRangeSpec(struct serverCommand *cmd, robj **argv, int argc
             } else {
                 serverPanic("%s built-in command declared keys positions"
                             " not matching the arity requirements.",
-                            server.extended_redis_compat ? "Redis" : "Valkey");
+                            "Valkey");
             }
         }
         keys[i].pos = j;

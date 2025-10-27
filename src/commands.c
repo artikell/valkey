@@ -11,8 +11,4 @@
 #define COMMAND_STRUCT serverCommand
 #define COMMAND_ARG serverCommandArg
 
-#ifdef LOG_REQ_RES
-#include "commands_with_reply_schema.def"
-#else
 #include "commands.def"
-#endif

@@ -141,11 +141,6 @@ void execCommandAbort(client *c, sds error) {
 
     if (error[0] == '-') error++;
     addReplyErrorFormat(c, "-EXECABORT Transaction discarded because of: %s", error);
-
-    /* Send EXEC to clients waiting data from MONITOR. We did send a MULTI
-     * already, and didn't send any of the queued commands, now we'll just send
-     * EXEC so it is clear that the transaction is over. */
-    replicationFeedMonitors(c, server.monitors, c->db->id, c->argv, c->argc);
 }
 
 void execCommand(client *c) {
@@ -202,36 +197,12 @@ void execCommand(client *c) {
         c->argv_len = c->mstate.commands[j].argv_len;
         c->cmd = c->realcmd = c->mstate.commands[j].cmd;
 
-        /* ACL permissions are also checked at the time of execution in case
-         * they were changed after the commands were queued. */
-        int acl_errpos;
-        int acl_retval = ACLCheckAllPerm(c, &acl_errpos);
-        if (acl_retval != ACL_OK) {
-            char *reason;
-            switch (acl_retval) {
-            case ACL_DENIED_CMD: reason = "no permission to execute the command or subcommand"; break;
-            case ACL_DENIED_KEY: reason = "no permission to touch the specified keys"; break;
-            case ACL_DENIED_CHANNEL:
-                reason = "no permission to access one of the channels used "
-                         "as arguments";
-                break;
-            default: reason = "no permission"; break;
-            }
-            addACLLogEntry(c, acl_retval, ACL_LOG_CTX_MULTI, acl_errpos, NULL, NULL);
-            addReplyErrorFormat(c,
-                                "-NOPERM ACLs rules changed between the moment the "
-                                "transaction was accumulated and the EXEC call. "
-                                "This command is no longer allowed for the "
-                                "following reason: %s",
-                                reason);
-        } else {
-            if (c->id == CLIENT_ID_AOF)
-                call(c, CMD_CALL_NONE);
-            else
-                call(c, CMD_CALL_FULL);
+        if (c->id == CLIENT_ID_AOF)
+            call(c, CMD_CALL_NONE);
+        else
+            call(c, CMD_CALL_FULL);
 
-            serverAssert(c->flag.blocked == 0);
-        }
+        serverAssert(c->flag.blocked == 0);
 
         /* Commands may alter argc/argv, restore mstate. */
         c->mstate.commands[j].argc = c->argc;

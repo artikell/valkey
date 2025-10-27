@@ -34,9 +34,6 @@
 #include "bio.h"
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
-#include "cluster.h"
-#include "threads_mngr.h"
-#include "io_threads.h"
 #include "sds.h"
 
 #include <arpa/inet.h>
@@ -507,7 +504,7 @@ void debugCommand(client *c) {
             "    When set to 1, it enforces the use of the client reply list directly",
             "    and avoids using the client's static buffer.",
             NULL};
-        addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
+        addExtendedReplyHelp(c, help, NULL);
     } else if (!strcasecmp(c->argv[1]->ptr, "segfault")) {
         /* Compiler gives warnings about writing to a random address
          * e.g "*((char*)-1) = 'x';". As a workaround, we map a read-only area
@@ -516,17 +513,6 @@ void debugCommand(client *c) {
         *p = 'x';
     } else if (!strcasecmp(c->argv[1]->ptr, "panic")) {
         serverPanic("DEBUG PANIC called at Unix time %lld", (long long)time(NULL));
-    } else if (!strcasecmp(c->argv[1]->ptr, "restart") || !strcasecmp(c->argv[1]->ptr, "crash-and-recover")) {
-        long long delay = 0;
-        if (c->argc >= 3) {
-            if (getLongLongFromObjectOrReply(c, c->argv[2], &delay, NULL) != C_OK) return;
-            if (delay < 0) delay = 0;
-        }
-        int flags = !strcasecmp(c->argv[1]->ptr, "restart")
-                        ? (RESTART_SERVER_GRACEFULLY | RESTART_SERVER_CONFIG_REWRITE)
-                        : RESTART_SERVER_NONE;
-        restartServer(c, flags, delay);
-        addReplyError(c, "failed to restart the server. Check server logs.");
     } else if (!strcasecmp(c->argv[1]->ptr, "oom")) {
         void *ptr = zmalloc(SIZE_MAX / 2); /* Should trigger an out of memory. */
         zfree(ptr);
@@ -539,135 +525,6 @@ void debugCommand(client *c) {
     } else if (!strcasecmp(c->argv[1]->ptr, "leak") && c->argc == 3) {
         sdsdup(c->argv[2]->ptr);
         addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "reload")) {
-        int flush = 1, save = 1;
-        int flags = RDBFLAGS_NONE;
-
-        /* Parse the additional options that modify the RELOAD
-         * behavior. */
-        for (int j = 2; j < c->argc; j++) {
-            char *opt = c->argv[j]->ptr;
-            if (!strcasecmp(opt, "MERGE")) {
-                flags |= RDBFLAGS_ALLOW_DUP;
-            } else if (!strcasecmp(opt, "NOFLUSH")) {
-                flush = 0;
-            } else if (!strcasecmp(opt, "NOSAVE")) {
-                save = 0;
-            } else {
-                addReplyError(c, "DEBUG RELOAD only supports the "
-                                 "MERGE, NOFLUSH and NOSAVE options.");
-                return;
-            }
-        }
-
-        /* The default behavior is to save the RDB file before loading
-         * it back. */
-        if (save) {
-            rdbSaveInfo rsi, *rsiptr;
-            rsiptr = rdbPopulateSaveInfo(&rsi);
-            if (rdbSave(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) != C_OK) {
-                addReplyErrorObject(c, shared.err);
-                return;
-            }
-        }
-
-        /* The default behavior is to remove the current dataset from
-         * memory before loading the RDB file, however when MERGE is
-         * used together with NOFLUSH, we are able to merge two datasets. */
-        if (flush) emptyData(-1, EMPTYDB_NO_FLAGS, NULL);
-
-        protectClient(c);
-        int ret = rdbLoad(server.rdb_filename, NULL, flags);
-        unprotectClient(c);
-        if (ret != RDB_OK) {
-            addReplyError(c, "Error trying to load the RDB dump, check server logs.");
-            return;
-        }
-        serverLog(LL_NOTICE, "DB reloaded by DEBUG RELOAD");
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "loadaof")) {
-        if (server.aof_state != AOF_OFF) flushAppendOnlyFile(1);
-        emptyData(-1, EMPTYDB_NO_FLAGS, NULL);
-        protectClient(c);
-        if (server.aof_manifest) aofManifestFree(server.aof_manifest);
-        aofLoadManifestFromDisk();
-        aofDelHistoryFiles();
-        int ret = loadAppendOnlyFiles(server.aof_manifest);
-        unprotectClient(c);
-        if (ret != AOF_OK && ret != AOF_EMPTY) {
-            addReplyError(c, "Error trying to load the AOF files, check server logs.");
-            return;
-        }
-        server.dirty = 0; /* Prevent AOF / replication */
-        serverLog(LL_NOTICE, "Append Only File loaded by DEBUG LOADAOF");
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "drop-cluster-packet-filter") && c->argc == 3) {
-        long packet_type;
-        if (getLongFromObjectOrReply(c, c->argv[2], &packet_type, NULL) != C_OK) return;
-        server.cluster_drop_packet_filter = packet_type;
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "close-cluster-link-on-packet-drop") && c->argc == 3) {
-        server.debug_cluster_close_link_on_packet_drop = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "object") && (c->argc == 3 || c->argc == 4)) {
-        dictEntry *de;
-        robj *val;
-        char *strenc;
-
-        int fast = 0;
-        if (c->argc == 4 && !strcasecmp(c->argv[3]->ptr, "fast")) fast = 1;
-
-        if ((de = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
-            addReplyErrorObject(c, shared.nokeyerr);
-            return;
-        }
-        val = dictGetVal(de);
-        strenc = strEncoding(val->encoding);
-
-        char extra[138] = {0};
-        if (val->encoding == OBJ_ENCODING_QUICKLIST) {
-            char *nextra = extra;
-            int remaining = sizeof(extra);
-            quicklist *ql = val->ptr;
-            /* Add number of quicklist nodes */
-            int used = snprintf(nextra, remaining, " ql_nodes:%lu", ql->len);
-            nextra += used;
-            remaining -= used;
-            /* Add average quicklist fill factor */
-            double avg = (double)ql->count / ql->len;
-            used = snprintf(nextra, remaining, " ql_avg_node:%.2f", avg);
-            nextra += used;
-            remaining -= used;
-            /* Add quicklist fill level / max listpack size */
-            used = snprintf(nextra, remaining, " ql_listpack_max:%d", ql->fill);
-            nextra += used;
-            remaining -= used;
-            /* Add isCompressed? */
-            int compressed = ql->compress != 0;
-            used = snprintf(nextra, remaining, " ql_compressed:%d", compressed);
-            nextra += used;
-            remaining -= used;
-            if (!fast) {
-                /* Add total uncompressed size */
-                unsigned long sz = 0;
-                for (quicklistNode *node = ql->head; node; node = node->next) {
-                    sz += node->sz;
-                }
-                used = snprintf(nextra, remaining, " ql_uncompressed_size:%lu", sz);
-                nextra += used;
-                remaining -= used;
-            }
-        }
-
-        sds s = sdsempty();
-        s = sdscatprintf(s, "Value at:%p refcount:%d encoding:%s", (void *)val, val->refcount, strenc);
-        if (!fast) s = sdscatprintf(s, " serializedlength:%zu", rdbSavedObjectLen(val, c->argv[2], c->db->id));
-        /* Either lru or lfu field could work correctly which depends on server.maxmemory_policy. */
-        s = sdscatprintf(s, " lru:%d lru_seconds_idle:%llu", val->lru, estimateObjectIdleTime(val) / 1000);
-        s = sdscatprintf(s, " lfu_freq:%lu lfu_access_time_minutes:%u", LFUDecrAndReturn(val), val->lru >> 8);
-        s = sdscatprintf(s, "%s", extra);
-        addReplyStatusLength(c, s, sdslen(s));
-        sdsfree(s);
     } else if (!strcasecmp(c->argv[1]->ptr, "sdslen") && c->argc == 3) {
         dictEntry *de;
         robj *val;
@@ -851,9 +708,6 @@ void debugCommand(client *c) {
         tv.tv_nsec = (utime % 1000000) * 1000;
         nanosleep(&tv, NULL);
         addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "set-active-expire") && c->argc == 3) {
-        server.active_expire_enabled = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "quicklist-packed-threshold") && c->argc == 3) {
         int memerr;
         unsigned long long sz = memtoull((const char *)c->argv[2]->ptr, &memerr);
@@ -862,15 +716,6 @@ void debugCommand(client *c) {
         } else {
             addReply(c, shared.ok);
         }
-    } else if (!strcasecmp(c->argv[1]->ptr, "set-skip-checksum-validation") && c->argc == 3) {
-        server.skip_checksum_validation = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "aof-flush-sleep") && c->argc == 3) {
-        server.aof_flush_sleep = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "replicate") && c->argc >= 3) {
-        replicationFeedReplicas(-1, c->argv + 2, c->argc - 2);
-        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "error") && c->argc == 3) {
         sds errstr = sdsnewlen("-", 1);
 
@@ -942,11 +787,6 @@ void debugCommand(client *c) {
             dictGetStats(buf, sizeof(buf), ht, full);
             addReplyVerbatim(c, buf, strlen(buf), "txt");
         }
-    } else if (!strcasecmp(c->argv[1]->ptr, "change-repl-id") && c->argc == 2) {
-        serverLog(LL_NOTICE, "Changing replication IDs after receiving DEBUG change-repl-id");
-        changeReplicationId();
-        clearReplicationId2();
-        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "stringmatch-test") && c->argc == 2) {
         stringmatchlen_fuzz_test();
         addReplyStatus(c, "Apparently the server did not crash: test passed");
@@ -989,9 +829,6 @@ void debugCommand(client *c) {
         mallctl_string(c, c->argv + 2, c->argc - 2);
         return;
 #endif
-    } else if (!strcasecmp(c->argv[1]->ptr, "pause-cron") && c->argc == 3) {
-        server.pause_cron = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "replybuffer") && c->argc == 4) {
         if (!strcasecmp(c->argv[2]->ptr, "peak-reset-time")) {
             if (!strcasecmp(c->argv[3]->ptr, "never")) {
@@ -1001,26 +838,15 @@ void debugCommand(client *c) {
             } else {
                 if (getLongFromObjectOrReply(c, c->argv[3], &server.reply_buffer_peak_reset_time, NULL) != C_OK) return;
             }
-        } else if (!strcasecmp(c->argv[2]->ptr, "resizing")) {
-            server.reply_buffer_resizing_enabled = atoi(c->argv[3]->ptr);
         } else {
             addReplySubcommandSyntaxError(c);
             return;
         }
         addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "pause-after-fork") && c->argc == 3) {
-        server.debug_pause_after_fork = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "delay-rdb-client-free-seconds") && c->argc == 3) {
-        server.wait_before_rdb_client_free = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
-        server.dict_resizing = atoi(c->argv[2]->ptr);
-        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "client-enforce-reply-list") && c->argc == 3) {
         server.debug_client_enforce_reply_list = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
-    } else if (!handleDebugClusterCommand(c)) {
+    } else {
         addReplySubcommandSyntaxError(c);
         return;
     }
@@ -1033,14 +859,12 @@ __attribute__((noinline)) void _serverAssert(const char *estr, const char *file,
     serverLog(LL_WARNING, "=== %sASSERTION FAILED ===", new_report ? "" : "RECURSIVE ");
     serverLog(LL_WARNING, "==> %s:%d '%s' is not true", file, line, estr);
 
-    if (server.crashlog_enabled) {
 #ifdef HAVE_BACKTRACE
-        logStackTrace(NULL, 1, 0);
+    logStackTrace(NULL, 1, 0);
 #endif
-        /* If this was a recursive assertion, it what most likely generated
-         * from printCrashReport. */
-        if (new_report) printCrashReport();
-    }
+    /* If this was a recursive assertion, it what most likely generated
+        * from printCrashReport. */
+    if (new_report) printCrashReport();
 
     // remove the signal handler so on abort() we will output the crash report.
     removeSigSegvHandlers();
@@ -1143,14 +967,12 @@ __attribute__((noinline)) void _serverPanic(const char *file, int line, const ch
     serverLog(LL_WARNING, "!!! Software Failure. Press left mouse button to continue");
     serverLog(LL_WARNING, "Guru Meditation: %s #%s:%d", fmtmsg, file, line);
 
-    if (server.crashlog_enabled) {
 #ifdef HAVE_BACKTRACE
-        logStackTrace(NULL, 1, 0);
+    logStackTrace(NULL, 1, 0);
 #endif
-        /* If this was a recursive panic, it what most likely generated
-         * from printCrashReport. */
-        if (new_report) printCrashReport();
-    }
+    /* If this was a recursive panic, it what most likely generated
+        * from printCrashReport. */
+    if (new_report) printCrashReport();
 
     // remove the signal handler so on abort() we will output the crash report.
     removeSigSegvHandlers();
@@ -1162,7 +984,7 @@ int bugReportStart(void) {
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
         serverLog(LL_WARNING | LL_RAW, "\n\n=== %s BUG REPORT START: Cut & paste starting from here ===\n",
-                  server.extended_redis_compat ? "REDIS" : "VALKEY");
+                  "VALKEY");
         bug_report_start = 1;
         pthread_mutex_unlock(&bug_report_start_mutex);
         return 1;
@@ -1652,17 +1474,6 @@ void closeDirectLogFiledes(int fd) {
     if (!log_to_stdout) close(fd);
 }
 
-#if defined(HAVE_BACKTRACE) && defined(__linux__)
-static int stacktrace_pipe[2] = {0};
-static void setupStacktracePipe(void) {
-    if (-1 == anetPipe(stacktrace_pipe, O_CLOEXEC | O_NONBLOCK, O_CLOEXEC | O_NONBLOCK)) {
-        serverLog(LL_WARNING, "setupStacktracePipe failed: %s", strerror(errno));
-    }
-}
-#else
-static void setupStacktracePipe(void) { /* we don't need a pipe to write the stacktraces */
-}
-#endif
 #ifdef HAVE_BACKTRACE
 #define BACKTRACE_MAX_SIZE 100
 
@@ -1676,7 +1487,6 @@ static void setupStacktracePipe(void) { /* we don't need a pipe to write the sta
 #include <dirent.h>
 
 #define TIDS_MAX_SIZE 50
-static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_SIZE]);
 
 typedef struct {
     char thread_name[16];
@@ -1684,80 +1494,6 @@ typedef struct {
     pid_t tid;
     void *trace[BACKTRACE_MAX_SIZE];
 } stacktrace_data;
-
-__attribute__((noinline)) static void collect_stacktrace_data(void) {
-    stacktrace_data trace_data = {{0}};
-
-    /* Get the stack trace first! */
-    trace_data.trace_size = backtrace(trace_data.trace, BACKTRACE_MAX_SIZE);
-
-    /* get the thread name */
-    prctl(PR_GET_NAME, trace_data.thread_name);
-
-    /* get the thread id */
-    trace_data.tid = syscall(SYS_gettid);
-
-    /* Send the output to the main process*/
-    if (write(stacktrace_pipe[1], &trace_data, sizeof(trace_data)) == -1) { /* Avoid warning. */
-    };
-}
-
-__attribute__((noinline)) static void writeStacktraces(int fd, int uplevel) {
-    /* get the list of all the process's threads that don't block or ignore the THREADS_SIGNAL */
-    pid_t tids[TIDS_MAX_SIZE];
-    size_t len_tids = get_ready_to_signal_threads_tids(THREADS_SIGNAL, tids);
-    if (!len_tids) {
-        serverLogRawFromHandler(LL_WARNING, "writeStacktraces(): Failed to get the process's threads.");
-    }
-
-    char buff[PIPE_BUF];
-    /* Clear the stacktraces pipe */
-    while (read(stacktrace_pipe[0], &buff, sizeof(buff)) > 0) {
-    }
-
-    /* ThreadsManager_runOnThreads returns 0 if it is already running */
-    if (!ThreadsManager_runOnThreads(tids, len_tids, collect_stacktrace_data)) return;
-
-    size_t collected = 0;
-
-    pid_t calling_tid = syscall(SYS_gettid);
-
-    /* Read the stacktrace_pipe until it's empty */
-    stacktrace_data curr_stacktrace_data = {{0}};
-    while (read(stacktrace_pipe[0], &curr_stacktrace_data, sizeof(curr_stacktrace_data)) > 0) {
-        /* stacktrace header includes the tid and the thread's name */
-        snprintf_async_signal_safe(buff, sizeof(buff), "\n%d %s", curr_stacktrace_data.tid,
-                                   curr_stacktrace_data.thread_name);
-        if (write(fd, buff, strlen(buff)) == -1) { /* Avoid warning. */
-        };
-
-        /* skip kernel call to the signal handler, the signal handler and the callback addresses */
-        int curr_uplevel = 3;
-
-        if (curr_stacktrace_data.tid == calling_tid) {
-            /* skip signal syscall and ThreadsManager_runOnThreads */
-            curr_uplevel += uplevel + 2;
-            /* Add an indication to header of the thread that is handling the log file */
-            if (write(fd, " *\n", strlen(" *\n")) == -1) { /* Avoid warning. */
-            };
-        } else {
-            /* just add a new line */
-            if (write(fd, "\n", strlen("\n")) == -1) { /* Avoid warning. */
-            };
-        }
-
-        /* add the stacktrace */
-        backtrace_symbols_fd(curr_stacktrace_data.trace + curr_uplevel, curr_stacktrace_data.trace_size - curr_uplevel,
-                             fd);
-
-        ++collected;
-    }
-
-    snprintf_async_signal_safe(buff, sizeof(buff), "\n%lu/%lu expected stacktraces.\n", (long unsigned)(collected),
-                               (long unsigned)len_tids);
-    if (write(fd, buff, strlen(buff)) == -1) { /* Avoid warning. */
-    };
-}
 
 #endif /* __linux__ */
 __attribute__((noinline)) static void writeCurrentThreadsStackTrace(int fd, int uplevel) {
@@ -1802,8 +1538,6 @@ __attribute__((noinline)) void logStackTrace(void *eip, int uplevel, int current
 #ifdef __linux__
     if (current_thread) {
         writeCurrentThreadsStackTrace(fd, uplevel);
-    } else {
-        writeStacktraces(fd, uplevel);
     }
 #else
     /* Outside of linux, we only support writing the current thread. */
@@ -1821,41 +1555,8 @@ __attribute__((noinline)) void logStackTrace(void *eip, int uplevel, int current
 
 #endif /* HAVE_BACKTRACE */
 
-sds genClusterDebugString(sds infostring) {
-    sds cluster_info = genClusterInfoString();
-    sds cluster_nodes = clusterGenNodesDescription(NULL, 0, 0);
-
-    infostring = sdscatprintf(infostring, "\r\n# Cluster info\r\n");
-    infostring = sdscatsds(infostring, cluster_info);
-    infostring = sdscatprintf(infostring, "\n------ CLUSTER NODES OUTPUT ------\n");
-    infostring = sdscatsds(infostring, cluster_nodes);
-
-    sdsfree(cluster_info);
-    sdsfree(cluster_nodes);
-
-    return infostring;
-}
-
 /* Log global server info */
 void logServerInfo(void) {
-    sds infostring, clients;
-    serverLogRaw(LL_WARNING | LL_RAW, "\n------ INFO OUTPUT ------\n");
-    int all = 0, everything = 0;
-    robj *argv[1];
-    argv[0] = createStringObject("all", strlen("all"));
-    dict *section_dict = genInfoSectionDict(argv, 1, NULL, &all, &everything);
-    infostring = genValkeyInfoString(section_dict, all, everything);
-    if (server.cluster_enabled) {
-        infostring = genClusterDebugString(infostring);
-    }
-    serverLogRaw(LL_WARNING | LL_RAW, infostring);
-    serverLogRaw(LL_WARNING | LL_RAW, "\n------ CLIENT LIST OUTPUT ------\n");
-    clients = getAllClientsInfoString(-1, server.hide_user_data_from_log);
-    serverLogRaw(LL_WARNING | LL_RAW, clients);
-    sdsfree(infostring);
-    sdsfree(clients);
-    releaseInfoSectionDict(section_dict);
-    decrRefCount(argv[0]);
 }
 
 /* Log certain config values, which can be used for debugging */
@@ -1923,111 +1624,12 @@ void logCurrentClient(client *cc, const char *title) {
     }
 }
 
-#if defined(HAVE_PROC_MAPS)
-
-#define MEMTEST_MAX_REGIONS 128
-
-/* A non destructive memory test executed during segfault. */
-int memtest_test_linux_anonymous_maps(void) {
-    FILE *fp;
-    char line[1024];
-    char logbuf[1024];
-    size_t start_addr, end_addr, size;
-    size_t start_vect[MEMTEST_MAX_REGIONS];
-    size_t size_vect[MEMTEST_MAX_REGIONS];
-    int regions = 0, j;
-
-    int fd = openDirectLogFiledes();
-    if (fd == -1) return 0;
-
-    fp = fopen("/proc/self/maps", "r");
-    if (!fp) {
-        closeDirectLogFiledes(fd);
-        return 0;
-    }
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        char *start, *end, *p = line;
-
-        start = p;
-        p = strchr(p, '-');
-        if (!p) continue;
-        *p++ = '\0';
-        end = p;
-        p = strchr(p, ' ');
-        if (!p) continue;
-        *p++ = '\0';
-        if (strstr(p, "stack") || strstr(p, "vdso") || strstr(p, "vsyscall")) continue;
-        if (!strstr(p, "00:00")) continue;
-        if (!strstr(p, "rw")) continue;
-
-        start_addr = strtoul(start, NULL, 16);
-        end_addr = strtoul(end, NULL, 16);
-        size = end_addr - start_addr;
-
-        start_vect[regions] = start_addr;
-        size_vect[regions] = size;
-        snprintf(logbuf, sizeof(logbuf), "*** Preparing to test memory region %lx (%lu bytes)\n",
-                 (unsigned long)start_vect[regions], (unsigned long)size_vect[regions]);
-        if (write(fd, logbuf, strlen(logbuf)) == -1) { /* Nothing to do. */
-        }
-        regions++;
-    }
-
-    int errors = 0;
-    for (j = 0; j < regions; j++) {
-        if (write(fd, ".", 1) == -1) { /* Nothing to do. */
-        }
-        errors += memtest_preserving_test((void *)start_vect[j], size_vect[j], 1);
-        if (write(fd, errors ? "E" : "O", 1) == -1) { /* Nothing to do. */
-        }
-    }
-    if (write(fd, "\n", 1) == -1) { /* Nothing to do. */
-    }
-
-    /* NOTE: It is very important to close the file descriptor only now
-     * because closing it before may result into unmapping of some memory
-     * region that we are testing. */
-    fclose(fp);
-    closeDirectLogFiledes(fd);
-    return errors;
-}
-#endif /* HAVE_PROC_MAPS */
-
-static void killMainThread(void) {
-    int err;
-    if (pthread_self() != server.main_thread_id && pthread_cancel(server.main_thread_id) == 0) {
-        if ((err = pthread_join(server.main_thread_id, NULL)) != 0) {
-            serverLog(LL_WARNING, "main thread can not be joined: %s", strerror(err));
-        } else {
-            serverLog(LL_WARNING, "main thread terminated");
-        }
-    }
-}
-
 /* Kill the running threads (other than current) in an unclean way. This function
  * should be used only when it's critical to stop the threads for some reason.
  * Currently the server does this only on crash (for instance on SIGSEGV) in order
  * to perform a fast memory check without other threads messing with memory. */
 void killThreads(void) {
-    killMainThread();
     bioKillThreads();
-    killIOThreads();
-}
-
-void doFastMemoryTest(void) {
-#if defined(HAVE_PROC_MAPS)
-    if (server.memcheck_enabled) {
-        /* Test memory */
-        serverLogRaw(LL_WARNING | LL_RAW, "\n------ FAST MEMORY TEST ------\n");
-        killThreads();
-        if (memtest_test_linux_anonymous_maps()) {
-            serverLogRaw(LL_WARNING | LL_RAW, "!!! MEMORY ERROR DETECTED! Check your memory ASAP !!!\n");
-        } else {
-            serverLogRaw(LL_WARNING | LL_RAW, "Fast memory test PASSED, however your memory can still be broken. "
-                                              "Please run a memory test for several hours if possible.\n");
-        }
-    }
-#endif /* HAVE_PROC_MAPS */
 }
 
 /* Scans the (assumed) x86 code starting at addr, for a max of `len`
@@ -2154,8 +1756,6 @@ __attribute__((noinline)) static void sigsegvHandler(int sig, siginfo_t *info, v
 }
 
 void setupDebugSigHandlers(void) {
-    setupStacktracePipe();
-
     setupSigSegvHandler();
 
     struct sigaction act;
@@ -2186,13 +1786,11 @@ void setupSigSegvHandler(void) {
      * Otherwise, sa_handler is used. */
     act.sa_flags = SA_NODEFER | SA_SIGINFO;
     act.sa_sigaction = sigsegvHandler;
-    if (server.crashlog_enabled) {
-        sigaction(SIGSEGV, &act, NULL);
-        sigaction(SIGBUS, &act, NULL);
-        sigaction(SIGFPE, &act, NULL);
-        sigaction(SIGILL, &act, NULL);
-        sigaction(SIGABRT, &act, NULL);
-    }
+    sigaction(SIGSEGV, &act, NULL);
+    sigaction(SIGBUS, &act, NULL);
+    sigaction(SIGFPE, &act, NULL);
+    sigaction(SIGILL, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
 }
 
 void removeSigSegvHandlers(void) {
@@ -2222,9 +1820,6 @@ void printCrashReport(void) {
     /* Log debug config information, which are some values
      * which may be useful for debugging crashes. */
     logConfigDebugInfo();
-
-    /* Run memory test in case the crash was triggered by memory corruption. */
-    doFastMemoryTest();
 }
 
 void bugReportEnd(int killViaSignal, int sig) {
@@ -2237,18 +1832,10 @@ void bugReportEnd(int killViaSignal, int sig) {
                          "  If a module was involved, please open in the module's repo instead.\n\n"
                          "  Suspect RAM error? Use valkey-server --test-memory to verify it.\n\n"
                          "  Some other issues could be detected by valkey-server --check-system\n",
-                         server.extended_redis_compat ? "REDIS" : "VALKEY");
+                         "VALKEY");
 
-    /* free(messages); Don't call free() with possibly corrupted memory. */
-    if (server.daemonize && server.supervised == 0 && server.pidfile) unlink(server.pidfile);
 
     if (!killViaSignal) {
-        /* To avoid issues with valgrind, we may wanna exit rather than generate a signal */
-        if (server.use_exit_on_panic) {
-            /* Using _exit to bypass false leak reports by gcc ASAN */
-            fflush(stdout);
-            _exit(1);
-        }
         abort();
     }
 
@@ -2311,34 +1898,6 @@ void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
     serverLogRawFromHandler(LL_WARNING, "--------\n");
 }
 
-/* Schedule a SIGALRM delivery after the specified period in milliseconds.
- * If a timer is already scheduled, this function will re-schedule it to the
- * specified time. If period is 0 the current timer is disabled. */
-void watchdogScheduleSignal(int period) {
-    struct itimerval it;
-
-    /* Will stop the timer if period is 0. */
-    it.it_value.tv_sec = period / 1000;
-    it.it_value.tv_usec = (period % 1000) * 1000;
-    /* Don't automatically restart. */
-    it.it_interval.tv_sec = 0;
-    it.it_interval.tv_usec = 0;
-    setitimer(ITIMER_REAL, &it, NULL);
-}
-void applyWatchdogPeriod(void) {
-    /* Disable watchdog when period is 0 */
-    if (server.watchdog_period == 0) {
-        watchdogScheduleSignal(0); /* Stop the current timer. */
-    } else {
-        /* If the configured period is smaller than twice the timer period, it is
-         * too short for the software watchdog to work reliably. Fix it now
-         * if needed. */
-        int min_period = (1000 / server.hz) * 2;
-        if (server.watchdog_period < min_period) server.watchdog_period = min_period;
-        watchdogScheduleSignal(server.watchdog_period); /* Adjust the current timer. */
-    }
-}
-
 void debugPauseProcess(void) {
     serverLog(LL_NOTICE, "Process is about to stop.");
     raise(SIGSTOP);
@@ -2359,59 +1918,6 @@ void debugDelay(int usec) {
 
 /* =========================== Stacktrace Utils ============================ */
 
-
-/** If it doesn't block and doesn't ignore, return 1 (the thread will handle the signal)
- * If thread tid blocks or ignores sig_num returns 0 (thread is not ready to catch the signal).
- * also returns 0 if something is wrong and prints a warning message to the log file **/
-static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char *tid, int sig_num) {
-    /* Open the threads status file path /proc/<pid>>/task/<tid>/status */
-    char path_buff[PATH_MAX];
-    snprintf_async_signal_safe(path_buff, PATH_MAX, "%s/%s/status", proc_pid_task_path, tid);
-
-    int thread_status_file = open(path_buff, O_RDONLY);
-    char buff[PATH_MAX];
-    if (thread_status_file == -1) {
-        serverLogFromHandler(LL_WARNING, "tid:%s: failed to open %s file", tid, path_buff);
-        return 0;
-    }
-
-    int ret = 1;
-    size_t field_name_len = strlen("SigBlk:\t"); /* SigIgn has the same length */
-    char *line = NULL;
-    size_t fields_count = 2;
-    while ((line = fgets_async_signal_safe(buff, PATH_MAX, thread_status_file)) && fields_count) {
-        /* iterate the file until we reach SigBlk or SigIgn field line */
-        if (!strncmp(buff, "SigBlk:\t", field_name_len) || !strncmp(buff, "SigIgn:\t", field_name_len)) {
-            line = buff + field_name_len;
-            unsigned long sig_mask;
-            if (-1 == string2ul_base16_async_signal_safe(line, sizeof(buff), &sig_mask)) {
-                serverLogRawFromHandler(LL_WARNING, "Can't convert signal mask to an unsigned long due to an overflow");
-                ret = 0;
-                break;
-            }
-
-            /* The bit position in a signal mask aligns with the signal number. Since signal numbers start from 1
-            we need to adjust the signal number by subtracting 1 to align it correctly with the zero-based indexing used
-          */
-            if (sig_mask & (1L << (sig_num - 1))) { /* if the signal is blocked/ignored return 0 */
-                ret = 0;
-                break;
-            }
-            --fields_count;
-        }
-    }
-
-    close(thread_status_file);
-
-    /* if we reached EOF, it means we haven't found SigBlk or/and SigIgn, something is wrong */
-    if (line == NULL) {
-        ret = 0;
-        serverLogFromHandler(LL_WARNING, "tid:%s: failed to find SigBlk or/and SigIgn field(s) in %s/%s/status file",
-                             tid, proc_pid_task_path, tid);
-    }
-    return ret;
-}
-
 /** We are using syscall(SYS_getdents64) to read directories, which unlike opendir(), is considered
  * async-signal-safe. This function wrapper getdents64() in glibc is supported as of glibc 2.30.
  * To support earlier versions of glibc, we use syscall(SYS_getdents64), which requires defining
@@ -2425,76 +1931,5 @@ struct linux_dirent64 {
     unsigned char d_type;
     char d_name[256]; /* Filename (null-terminated) */
 };
-
-/** Returns the number of the process's threads that can receive signal sig_num.
- * Writes into tids the tids of these threads.
- * If it fails, returns 0.
- */
-static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_SIZE]) {
-    /* Open /proc/<pid>/task file. */
-    char path_buff[PATH_MAX];
-    snprintf_async_signal_safe(path_buff, PATH_MAX, "/proc/%d/task", getpid());
-
-    int dir;
-    if (-1 == (dir = open(path_buff, O_RDONLY | O_DIRECTORY))) return 0;
-
-    size_t tids_count = 0;
-    pid_t calling_tid = syscall(SYS_gettid);
-    int current_thread_index = -1;
-    long nread;
-    char buff[PATH_MAX];
-
-    /* readdir() is not async-signal-safe (AS-safe).
-    Hence, we read the file using SYS_getdents64, which is considered AS-sync*/
-    while ((nread = syscall(SYS_getdents64, dir, buff, PATH_MAX))) {
-        if (nread == -1) {
-            close(dir);
-            serverLogRawFromHandler(LL_WARNING,
-                                    "get_ready_to_signal_threads_tids(): Failed to read the process's task directory");
-            return 0;
-        }
-        /* Each thread is represented by a directory */
-        for (long pos = 0; pos < nread;) {
-            struct linux_dirent64 *entry = (struct linux_dirent64 *)(buff + pos);
-            pos += entry->d_reclen;
-            /* Skip irrelevant directories. */
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-
-            /* the thread's directory name is equivalent to its tid. */
-            long tid;
-            string2l(entry->d_name, strlen(entry->d_name), &tid);
-
-            if (!is_thread_ready_to_signal(path_buff, entry->d_name, sig_num)) continue;
-
-            if (tid == calling_tid) {
-                current_thread_index = tids_count;
-            }
-
-            /* save the thread id */
-            tids[tids_count++] = tid;
-
-            /* Stop if we reached the maximum threads number. */
-            if (tids_count == TIDS_MAX_SIZE) {
-                serverLogRawFromHandler(LL_WARNING,
-                                        "get_ready_to_signal_threads_tids(): Reached the limit of the tids buffer.");
-                break;
-            }
-        }
-
-        if (tids_count == TIDS_MAX_SIZE) break;
-    }
-
-    /* Swap the last tid with the current thread id */
-    if (current_thread_index != -1) {
-        pid_t last_tid = tids[tids_count - 1];
-
-        tids[tids_count - 1] = calling_tid;
-        tids[current_thread_index] = last_tid;
-    }
-
-    close(dir);
-
-    return tids_count;
-}
 #endif /* __linux__ */
 #endif /* HAVE_BACKTRACE */

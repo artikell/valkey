@@ -330,39 +330,7 @@ unsigned long LFUDecrAndReturn(robj *o) {
  *
  * This function returns the sum of AOF and replication buffer. */
 size_t freeMemoryGetNotCountedMemory(void) {
-    size_t overhead = 0;
-
-    /* Since all replicas and replication backlog share global replication
-     * buffer, we think only the part of exceeding backlog size is the extra
-     * separate consumption of replicas.
-     *
-     * Note that although the backlog is also initially incrementally grown
-     * (pushing DELs consumes memory), it'll eventually stop growing and
-     * remain constant in size, so even if its creation will cause some
-     * eviction, it's capped, and also here to stay (no resonance effect)
-     *
-     * Note that, because we trim backlog incrementally in the background,
-     * backlog size may exceeds our setting if slow replicas that reference
-     * vast replication buffer blocks disconnect. To avoid massive eviction
-     * loop, we don't count the delayed freed replication backlog into used
-     * memory even if there are no replicas, i.e. we still regard this memory
-     * as replicas'. */
-    if ((long long)server.repl_buffer_mem > server.repl_backlog_size) {
-        /* We use list structure to manage replication buffer blocks, so backlog
-         * also occupies some extra memory, we can't know exact blocks numbers,
-         * we only get approximate size according to per block size. */
-        size_t extra_approx_size =
-            (server.repl_backlog_size / PROTO_REPLY_CHUNK_BYTES + 1) * (sizeof(replBufBlock) + sizeof(listNode));
-        size_t counted_mem = server.repl_backlog_size + extra_approx_size;
-        if (server.repl_buffer_mem > counted_mem) {
-            overhead += (server.repl_buffer_mem - counted_mem);
-        }
-    }
-
-    if (server.aof_state != AOF_OFF) {
-        overhead += sdsAllocSize(server.aof_buf);
-    }
-    return overhead;
+    return 0;
 }
 
 /* Get the memory status from the point of view of the maxmemory directive:
@@ -447,24 +415,9 @@ int overMaxmemoryAfterAlloc(size_t moremem) {
  * eviction cycles until the "maxmemory" condition has resolved or there are no
  * more evictable items.  */
 static int isEvictionProcRunning = 0;
-static int evictionTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    UNUSED(eventLoop);
-    UNUSED(id);
-    UNUSED(clientData);
-
-    if (performEvictions() == EVICT_RUNNING) return 0; /* keep evicting */
-
-    /* For EVICT_OK - things are good, no need to keep evicting.
-     * For EVICT_FAIL - there is nothing left to evict.  */
-    isEvictionProcRunning = 0;
-    return AE_NOMORE;
-}
 
 void startEvictionTimeProc(void) {
-    if (!isEvictionProcRunning) {
-        isEvictionProcRunning = 1;
-        aeCreateTimeEvent(server.el, 0, evictionTimeProc, NULL, NULL);
-    }
+
 }
 
 /* Check if it's safe to perform evictions.
@@ -475,10 +428,6 @@ static int isSafeToPerformEvictions(void) {
     /* - There must be no script in timeout condition.
      * - Nor we are loading data right now.  */
     if (isInsideYieldingLongCommand() || server.loading) return 0;
-
-    /* By default replicas should ignore maxmemory
-     * and just be primaries exact copies. */
-    if (server.primary_host && server.repl_replica_ignore_maxmemory) return 0;
 
     /* If 'evict' action is paused, for whatever reason, then return false */
     if (isPausedActionsWithUpdate(PAUSE_ACTION_EVICT)) return 0;
@@ -536,9 +485,7 @@ int performEvictions(void) {
     int keys_freed = 0;
     size_t mem_reported, mem_tofree;
     long long mem_freed = 0; /* Maybe become negative */
-    mstime_t latency, eviction_latency;
     long long delta;
-    int replicas = listLength(server.replicas);
     int result = EVICT_FAIL;
 
     if (getMaxmemoryState(&mem_reported, NULL, &mem_tofree, NULL) == C_OK) {
@@ -552,8 +499,6 @@ int performEvictions(void) {
     }
 
     unsigned long eviction_time_limit_us = evictionTimeLimitUs();
-
-    latencyStartMonitor(latency);
 
     monotime evictionTimer;
     elapsedStart(&evictionTimer);
@@ -677,10 +622,7 @@ int performEvictions(void) {
              * we only care about memory used by the key space. */
             enterExecutionUnit(1, 0);
             delta = (long long)zmalloc_used_memory();
-            latencyStartMonitor(eviction_latency);
             dbGenericDelete(db, keyobj, server.lazyfree_lazy_eviction, DB_FLAG_KEY_EVICTED);
-            latencyEndMonitor(eviction_latency);
-            latencyAddSampleIfNeeded("eviction-del", eviction_latency);
             delta -= (long long)zmalloc_used_memory();
             mem_freed += delta;
             server.stat_evictedkeys++;
@@ -693,12 +635,6 @@ int performEvictions(void) {
             keys_freed++;
 
             if (keys_freed % 16 == 0) {
-                /* When the memory to free starts to be big enough, we may
-                 * start spending so much time here that is impossible to
-                 * deliver data to the replicas fast enough, so we force the
-                 * transmission here inside the loop. */
-                if (replicas) flushReplicasOutputBuffers();
-
                 /* Normally our stop condition is the ability to release
                  * a fixed, pre-computed amount of memory. However when we
                  * are deleting objects in another thread, it's better to
@@ -733,8 +669,6 @@ cant_free:
         /* At this point, we have run out of evictable items.  It's possible
          * that some items are being freed in the lazyfree thread.  Perform a
          * short wait here if such jobs exist, but don't wait long.  */
-        mstime_t lazyfree_latency;
-        latencyStartMonitor(lazyfree_latency);
         while (bioPendingJobsOfType(BIO_LAZY_FREE) && elapsedUs(evictionTimer) < eviction_time_limit_us) {
             if (getMaxmemoryState(NULL, NULL, NULL, NULL) == C_OK) {
                 result = EVICT_OK;
@@ -742,12 +676,7 @@ cant_free:
             }
             usleep(eviction_time_limit_us < 1000 ? eviction_time_limit_us : 1000);
         }
-        latencyEndMonitor(lazyfree_latency);
-        latencyAddSampleIfNeeded("eviction-lazyfree", lazyfree_latency);
     }
-
-    latencyEndMonitor(latency);
-    latencyAddSampleIfNeeded("eviction-cycle", latency);
 
 update_metrics:
     if (result == EVICT_RUNNING || result == EVICT_FAIL) {

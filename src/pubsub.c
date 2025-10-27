@@ -28,8 +28,6 @@
  */
 
 #include "server.h"
-#include "cluster.h"
-#include "cluster_slot_stats.h"
 
 /* Structure to hold the pubsub related metadata. Currently used
  * for pubsub and pubsubshard feature. */
@@ -267,11 +265,6 @@ int pubsubSubscribeChannel(client *c, robj *channel, pubsubtype type) {
     void *position = dictFindPositionForInsert(type.clientPubSubChannels(c), channel, NULL);
     if (position) { /* Not yet subscribed to this channel */
         retval = 1;
-        /* Add the client to the channel -> list of clients hash table */
-        if (server.cluster_enabled && type.shard) {
-            slot = getKeySlot(channel->ptr);
-        }
-
         de = kvstoreDictAddRaw(*type.serverPubSubChannels, slot, channel, &existing);
 
         if (existing) {
@@ -305,12 +298,6 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify, pubsubtype ty
                             we have in the hash tables. Protect it... */
     if (dictDelete(type.clientPubSubChannels(c), channel) == DICT_OK) {
         retval = 1;
-        /* Remove the client from the channel -> clients list hash table */
-        if (server.cluster_enabled && type.shard) {
-            /* Using keyHashSlot directly because we can't rely on the current_client's slot via getKeySlot() here,
-             * as it might differ from the channel's slot. */
-            slot = keyHashSlot(channel->ptr, (int)sdslen(channel->ptr));
-        }
         de = kvstoreDictFind(*type.serverPubSubChannels, slot, channel);
         serverAssertWithInfo(c, NULL, de != NULL);
         clients = dictGetVal(de);
@@ -479,11 +466,6 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
     dictEntry *de;
     dictIterator *di;
     int slot = -1;
-
-    /* Send to clients listening for that channel */
-    if (server.cluster_enabled && type.shard) {
-        slot = keyHashSlot(channel->ptr, sdslen(channel->ptr));
-    }
     de = kvstoreDictFind(*type.serverPubSubChannels, (slot == -1) ? 0 : slot, channel);
     if (de) {
         dict *clients = dictGetVal(de);
@@ -492,7 +474,6 @@ int pubsubPublishMessageInternal(robj *channel, robj *message, pubsubtype type) 
         while ((entry = dictNext(iter)) != NULL) {
             client *c = dictGetKey(entry);
             addReplyPubsubMessage(c, channel, message, *type.messageBulk);
-            clusterSlotStatsAddNetworkBytesOutForShardedPubSubInternalPropagation(c, slot);
             updateClientMemUsageAndBucket(c);
             receivers++;
         }
@@ -609,19 +590,13 @@ void punsubscribeCommand(client *c) {
  * Used by the commands PUBLISH/SPUBLISH and their respective module APIs.*/
 int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int sharded) {
     int receivers = pubsubPublishMessage(channel, message, sharded);
-    if (server.cluster_enabled) clusterPropagatePublish(channel, message, sharded);
     return receivers;
 }
 
 /* PUBLISH <channel> <message> */
 void publishCommand(client *c) {
-    if (server.sentinel_mode) {
-        sentinelPublishCommand(c);
-        return;
-    }
-
     int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1], c->argv[2], 0);
-    if (!server.cluster_enabled) forceCommandPropagation(c, PROPAGATE_REPL);
+    forceCommandPropagation(c, PROPAGATE_REPL);
     addReplyLongLong(c, receivers);
 }
 
@@ -669,8 +644,7 @@ void pubsubCommand(client *c) {
         int j;
         addReplyArrayLen(c, (c->argc - 2) * 2);
         for (j = 2; j < c->argc; j++) {
-            sds key = c->argv[j]->ptr;
-            unsigned int slot = server.cluster_enabled ? keyHashSlot(key, (int)sdslen(key)) : 0;
+            unsigned int slot = 0;
             dict *clients = kvstoreDictFetchValue(server.pubsubshard_channels, slot, c->argv[j]);
 
             addReplyBulk(c, c->argv[j]);
@@ -708,7 +682,7 @@ void channelList(client *c, sds pat, kvstore *pubsub_channels) {
 /* SPUBLISH <shardchannel> <message> */
 void spublishCommand(client *c) {
     int receivers = pubsubPublishMessageAndPropagateToCluster(c->argv[1], c->argv[2], 1);
-    if (!server.cluster_enabled) forceCommandPropagation(c, PROPAGATE_REPL);
+    forceCommandPropagation(c, PROPAGATE_REPL);
     addReplyLongLong(c, receivers);
 }
 

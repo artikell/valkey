@@ -159,11 +159,6 @@ static void engineLibraryDispose(dict *d, void *obj) {
     engineLibraryFree(obj);
 }
 
-/* Wrapper to free a library when used as a list free callback */
-static void engineLibraryListFree(void *obj) {
-    engineLibraryFree(obj);
-}
-
 /* Clear all the functions from the given library ctx */
 void functionsLibCtxClear(functionsLibCtx *lib_ctx) {
     dictEmpty(lib_ctx->functions, NULL);
@@ -315,87 +310,6 @@ static void libraryLink(functionsLibCtx *lib_ctx, functionLibInfo *li) {
     serverAssert(stats);
     stats->n_lib++;
     stats->n_functions += dictSize(li->functions);
-}
-
-/* Takes all libraries from lib_ctx_src and add to lib_ctx_dst.
- * On collision, if 'replace' argument is true, replace the existing library with the new one.
- * Otherwise abort and leave 'lib_ctx_dst' and 'lib_ctx_src' untouched.
- * Return C_OK on success and C_ERR if aborted. If C_ERR is returned, set a relevant
- * error message on the 'err' out parameter.
- *  */
-static int
-libraryJoin(functionsLibCtx *functions_lib_ctx_dst, functionsLibCtx *functions_lib_ctx_src, int replace, sds *err) {
-    int ret = C_ERR;
-    dictIterator *iter = NULL;
-    /* Stores the libraries we need to replace in case a revert is required.
-     * Only initialized when needed */
-    list *old_libraries_list = NULL;
-    dictEntry *entry = NULL;
-    iter = dictGetIterator(functions_lib_ctx_src->libraries);
-    while ((entry = dictNext(iter))) {
-        functionLibInfo *li = dictGetVal(entry);
-        functionLibInfo *old_li = dictFetchValue(functions_lib_ctx_dst->libraries, li->name);
-        if (old_li) {
-            if (!replace) {
-                /* library already exists, failed the restore. */
-                *err = sdscatfmt(sdsempty(), "Library %s already exists", li->name);
-                goto done;
-            } else {
-                if (!old_libraries_list) {
-                    old_libraries_list = listCreate();
-                    listSetFreeMethod(old_libraries_list, engineLibraryListFree);
-                }
-                libraryUnlink(functions_lib_ctx_dst, old_li);
-                listAddNodeTail(old_libraries_list, old_li);
-            }
-        }
-    }
-    dictReleaseIterator(iter);
-    iter = NULL;
-
-    /* Make sure no functions collision */
-    iter = dictGetIterator(functions_lib_ctx_src->functions);
-    while ((entry = dictNext(iter))) {
-        functionInfo *fi = dictGetVal(entry);
-        if (dictFetchValue(functions_lib_ctx_dst->functions, fi->name)) {
-            *err = sdscatfmt(sdsempty(), "Function %s already exists", fi->name);
-            goto done;
-        }
-    }
-    dictReleaseIterator(iter);
-    iter = NULL;
-
-    /* No collision, it is safe to link all the new libraries. */
-    iter = dictGetIterator(functions_lib_ctx_src->libraries);
-    while ((entry = dictNext(iter))) {
-        functionLibInfo *li = dictGetVal(entry);
-        libraryLink(functions_lib_ctx_dst, li);
-        dictSetVal(functions_lib_ctx_src->libraries, entry, NULL);
-    }
-    dictReleaseIterator(iter);
-    iter = NULL;
-
-    functionsLibCtxClear(functions_lib_ctx_src);
-    if (old_libraries_list) {
-        listRelease(old_libraries_list);
-        old_libraries_list = NULL;
-    }
-    ret = C_OK;
-
-done:
-    if (iter) dictReleaseIterator(iter);
-    if (old_libraries_list) {
-        /* Link back all libraries on tmp_l_ctx */
-        while (listLength(old_libraries_list) > 0) {
-            listNode *head = listFirst(old_libraries_list);
-            functionLibInfo *li = listNodeValue(head);
-            listNodeValue(head) = NULL;
-            libraryLink(functions_lib_ctx_dst, li);
-            listDelNode(old_libraries_list, head);
-        }
-        listRelease(old_libraries_list);
-    }
-    return ret;
 }
 
 /* Register an engine, should be called once by the engine on startup and give the following:
@@ -616,9 +530,6 @@ uint64_t fcallGetCommandFlags(client *c, uint64_t cmd_flags) {
 }
 
 static void fcallCommandGeneric(client *c, int ro) {
-    /* Functions need to be fed to monitors before the commands they execute. */
-    replicationFeedMonitors(c, server.monitors, c->db->id, c->argv, c->argc);
-
     robj *function_name = c->argv[1];
     dictEntry *de = c->cur_script;
     if (!de) de = dictFind(curr_functions_lib_ctx->functions, function_name->ptr);
@@ -684,24 +595,26 @@ void fcallroCommand(client *c) {
  * crc64 is saved so we can verify the payload content.
  */
 void functionDumpCommand(client *c) {
-    unsigned char buf[2];
-    uint64_t crc;
-    rio payload;
-    rioInitWithBuffer(&payload, sdsempty());
+    UNUSED(c);
+    // unsigned char buf[2];
+    // uint64_t crc;
+    // rio payload;
+    // rioInitWithBuffer(&payload, sdsempty());
 
-    rdbSaveFunctions(&payload);
+    // rdbSaveFunctions(&payload);
 
-    /* RDB version */
-    buf[0] = RDB_VERSION & 0xff;
-    buf[1] = (RDB_VERSION >> 8) & 0xff;
-    payload.io.buffer.ptr = sdscatlen(payload.io.buffer.ptr, buf, 2);
+    // /* RDB version */
+    // buf[0] = RDB_VERSION & 0xff;
+    // buf[1] = (RDB_VERSION >> 8) & 0xff;
+    // payload.io.buffer.ptr = sdscatlen(payload.io.buffer.ptr, buf, 2);
 
-    /* CRC64 */
-    crc = crc64(0, (unsigned char *)payload.io.buffer.ptr, sdslen(payload.io.buffer.ptr));
-    memrev64ifbe(&crc);
-    payload.io.buffer.ptr = sdscatlen(payload.io.buffer.ptr, &crc, 8);
+    // /* CRC64 */
+    // crc = crc64(0, (unsigned char *)payload.io.buffer.ptr, sdslen(payload.io.buffer.ptr));
+    // memrev64ifbe(&crc);
+    // payload.io.buffer.ptr = sdscatlen(payload.io.buffer.ptr, &crc, 8);
 
-    addReplyBulkSds(c, payload.io.buffer.ptr);
+    // addReplyBulkSds(c, payload.io.buffer.ptr);
+    return;
 }
 
 /*
@@ -715,86 +628,88 @@ void functionDumpCommand(client *c) {
  *   On collision, replace the old libraries with the new libraries.
  */
 void functionRestoreCommand(client *c) {
-    if (c->argc > 4) {
-        addReplySubcommandSyntaxError(c);
-        return;
-    }
+    addReplySubcommandSyntaxError(c);
+    return;
+//     if (c->argc > 4) {
+//         addReplySubcommandSyntaxError(c);
+//         return;
+//     }
 
-    restorePolicy restore_replicy = restorePolicy_Append; /* default policy: APPEND */
-    sds data = c->argv[2]->ptr;
-    size_t data_len = sdslen(data);
-    rio payload;
-    sds err = NULL;
+//     restorePolicy restore_replicy = restorePolicy_Append; /* default policy: APPEND */
+//     sds data = c->argv[2]->ptr;
+//     size_t data_len = sdslen(data);
+//     rio payload;
+//     sds err = NULL;
 
-    if (c->argc == 4) {
-        const char *restore_policy_str = c->argv[3]->ptr;
-        if (!strcasecmp(restore_policy_str, "append")) {
-            restore_replicy = restorePolicy_Append;
-        } else if (!strcasecmp(restore_policy_str, "replace")) {
-            restore_replicy = restorePolicy_Replace;
-        } else if (!strcasecmp(restore_policy_str, "flush")) {
-            restore_replicy = restorePolicy_Flush;
-        } else {
-            addReplyError(c, "Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE.");
-            return;
-        }
-    }
+//     if (c->argc == 4) {
+//         const char *restore_policy_str = c->argv[3]->ptr;
+//         if (!strcasecmp(restore_policy_str, "append")) {
+//             restore_replicy = restorePolicy_Append;
+//         } else if (!strcasecmp(restore_policy_str, "replace")) {
+//             restore_replicy = restorePolicy_Replace;
+//         } else if (!strcasecmp(restore_policy_str, "flush")) {
+//             restore_replicy = restorePolicy_Flush;
+//         } else {
+//             addReplyError(c, "Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE.");
+//             return;
+//         }
+//     }
 
-    uint16_t rdbver;
-    if (verifyDumpPayload((unsigned char *)data, data_len, &rdbver) != C_OK) {
-        addReplyError(c, "DUMP payload version or checksum are wrong");
-        return;
-    }
+//     uint16_t rdbver;
+//     // if (verifyDumpPayload((unsigned char *)data, data_len, &rdbver) != C_OK) {
+//     //     addReplyError(c, "DUMP payload version or checksum are wrong");
+//     //     return;
+//     // }
 
-    functionsLibCtx *functions_lib_ctx = functionsLibCtxCreate();
-    rioInitWithBuffer(&payload, data);
+//     functionsLibCtx *functions_lib_ctx = functionsLibCtxCreate();
+//     rioInitWithBuffer(&payload, data);
 
-    /* Read until reaching last 10 bytes that should contain RDB version and checksum. */
-    while (data_len - payload.io.buffer.pos > 10) {
-        int type;
-        if ((type = rdbLoadType(&payload)) == -1) {
-            err = sdsnew("can not read data type");
-            goto load_error;
-        }
-        if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
-            err = sdsnew("Pre-GA function format not supported");
-            goto load_error;
-        }
-        if (type != RDB_OPCODE_FUNCTION2) {
-            err = sdsnew("given type is not a function");
-            goto load_error;
-        }
-        if (rdbFunctionLoad(&payload, rdbver, functions_lib_ctx, RDBFLAGS_NONE, &err) != C_OK) {
-            if (!err) {
-                err = sdsnew("failed loading the given functions payload");
-            }
-            goto load_error;
-        }
-    }
+//     /* Read until reaching last 10 bytes that should contain RDB version and checksum. */
+//     while (data_len - payload.io.buffer.pos > 10) {
+//         int type;
+//         if ((type = rdbLoadType(&payload)) == -1) {
+//             err = sdsnew("can not read data type");
+//             goto load_error;
+//         }
+//         if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
+//             err = sdsnew("Pre-GA function format not supported");
+//             goto load_error;
+//         }
+//         if (type != RDB_OPCODE_FUNCTION2) {
+//             err = sdsnew("given type is not a function");
+//             goto load_error;
+//         }
+//         // if (rdbFunctionLoad(&payload, rdbver, functions_lib_ctx, RDBFLAGS_NONE, &err) != C_OK) {
+//         //     if (!err) {
+//         //         err = sdsnew("failed loading the given functions payload");
+//         //     }
+//         //     goto load_error;
+//         // }
+//     }
 
-    if (restore_replicy == restorePolicy_Flush) {
-        functionsLibCtxSwapWithCurrent(functions_lib_ctx);
-        functions_lib_ctx = NULL; /* avoid releasing the f_ctx in the end */
-    } else {
-        if (libraryJoin(curr_functions_lib_ctx, functions_lib_ctx, restore_replicy == restorePolicy_Replace, &err) !=
-            C_OK) {
-            goto load_error;
-        }
-    }
+//     if (restore_replicy == restorePolicy_Flush) {
+//         functionsLibCtxSwapWithCurrent(functions_lib_ctx);
+//         functions_lib_ctx = NULL; /* avoid releasing the f_ctx in the end */
+//     } else {
+//         if (libraryJoin(curr_functions_lib_ctx, functions_lib_ctx, restore_replicy == restorePolicy_Replace, &err) !=
+//             C_OK) {
+//             goto load_error;
+//         }
+//     }
 
-    /* Indicate that the command changed the data so it will be replicated and
-     * counted as a data change (for persistence configuration) */
-    server.dirty++;
+//     /* Indicate that the command changed the data so it will be replicated and
+//      * counted as a data change (for persistence configuration) */
+//     server.dirty++;
 
-load_error:
-    if (err) {
-        addReplyErrorSds(c, err);
-    } else {
-        addReply(c, shared.ok);
-    }
-    if (functions_lib_ctx) {
-        functionsLibCtxFree(functions_lib_ctx);
-    }
+// load_error:
+//     if (err) {
+//         addReplyErrorSds(c, err);
+//     } else {
+//         addReply(c, shared.ok);
+//     }
+//     if (functions_lib_ctx) {
+//         functionsLibCtxFree(functions_lib_ctx);
+//     }
 }
 
 /* FUNCTION FLUSH [ASYNC | SYNC] */

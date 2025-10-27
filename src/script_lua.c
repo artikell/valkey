@@ -33,7 +33,6 @@
 #include "server.h"
 #include "sha1.h"
 #include "rand.h"
-#include "cluster.h"
 #include "monotonic.h"
 #include "resp_parser.h"
 #include "version.h"
@@ -1117,12 +1116,7 @@ static int luaRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
         luaPushError(lua, "Invalid command passed to server.acl_check_cmd()");
         raise_error = 1;
     } else {
-        int keyidxptr;
-        if (ACLCheckAllUserCommandPerm(rctx->original_client->user, cmd, argv, argc, &keyidxptr) != ACL_OK) {
-            lua_pushboolean(lua, 0);
-        } else {
-            lua_pushboolean(lua, 1);
-        }
+        lua_pushboolean(lua, 1);
     }
 
     freeLuaRedisArgv(argv, argc, argv_len);
