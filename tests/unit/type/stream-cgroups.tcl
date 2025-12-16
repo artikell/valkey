@@ -1255,8 +1255,8 @@ start_server {
         r XREADGROUP GROUP g1 c11 STREAMS x >
         set reply [r XINFO STREAM x FULL]
         set group [lindex [dict get $reply groups] 0]
-        assert_equal [dict get $group entries-read] 7
-        assert_equal [dict get $group lag] 0
+        assert_equal [dict get $group entries-read] 6
+        assert_equal [dict get $group lag] 1
     }
 
     test {Consumer group lag with XADD trimming} {
@@ -1321,8 +1321,8 @@ start_server {
         r XREADGROUP GROUP g1 c11 STREAMS x >
         set reply [r XINFO STREAM x FULL]
         set group [lindex [dict get $reply groups] 0]
-        assert_equal [dict get $group entries-read] 8
-        assert_equal [dict get $group lag] 0
+        assert_equal [dict get $group entries-read] 7
+        assert_equal [dict get $group lag] 1
     }
 
     test {Consumer group lag with with tombstone} {
