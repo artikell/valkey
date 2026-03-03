@@ -48,7 +48,6 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/cluster_legacy.c
     ${CMAKE_SOURCE_DIR}/src/cluster_slot_stats.c
     ${CMAKE_SOURCE_DIR}/src/crc16.c
-    ${CMAKE_SOURCE_DIR}/src/endianconv.c
     ${CMAKE_SOURCE_DIR}/src/commandlog.c
     ${CMAKE_SOURCE_DIR}/src/eval.c
     ${CMAKE_SOURCE_DIR}/src/bio.c
@@ -117,6 +116,7 @@ set(VALKEY_SERVER_SRCS
     ${CMAKE_SOURCE_DIR}/src/unix.c
     ${CMAKE_SOURCE_DIR}/src/server.c
     ${CMAKE_SOURCE_DIR}/src/logreqres.c
+    ${CMAKE_SOURCE_DIR}/src/external_data.c
     ${CMAKE_SOURCE_DIR}/src/entry.c
     ${CMAKE_SOURCE_DIR}/src/vset.c
     ${CMAKE_SOURCE_DIR}/src/fifo.c

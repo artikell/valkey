@@ -112,6 +112,8 @@ typedef struct serverObject robj;
 #include "crc64.h"
 
 struct hdr_histogram;
+struct ValkeyModule;
+
 
 /* helpers */
 #define numElements(x) (sizeof(x) / sizeof((x)[0]))
@@ -545,6 +547,10 @@ typedef enum {
 #define REPL_DISKLESS_LOAD_SWAPDB 2
 #define REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD 3
 
+/* External data options */
+#define EXT_DATA_NONE 0
+#define EXT_DATA_KV 1
+
 /* TLS Client Authentication */
 #define TLS_CLIENT_AUTH_NO 0
 #define TLS_CLIENT_AUTH_YES 1
@@ -625,7 +631,8 @@ typedef enum {
 
 /* Sets log format */
 typedef enum { LOG_FORMAT_LEGACY = 0,
-               LOG_FORMAT_LOGFMT } log_format_type;
+               LOG_FORMAT_LOGFMT,
+               LOG_FORMAT_JSON } log_format_type;
 
 /* Sets log timestamp format */
 typedef enum { LOG_TIMESTAMP_LEGACY = 0,
@@ -756,6 +763,7 @@ typedef enum {
                                 * at argv[2]. */
 #define ARGS_SET_FNX (1 << 11) /* Set if key item not exists. */
 #define ARGS_SET_FXX (1 << 12) /* Set if key item exists. */
+#define ARGS_SET_EXT (1 << 13) /* Set directly to external storage. */
 
 /* An Object, that is a type able to hold a string / list / set */
 
@@ -802,19 +810,59 @@ typedef struct ValkeyModuleType moduleType;
 #define OBJ_ENCODING_STREAM 10    /* Encoded as a radix tree of listpacks */
 #define OBJ_ENCODING_LISTPACK 11  /* Encoded as a listpack */
 
-#define OBJ_REFCOUNT_BITS 30
+#define OBJ_REFCOUNT_BITS 29
 #define OBJ_SHARED_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 1) /* Global object never destroyed. */
 #define OBJ_STATIC_REFCOUNT ((1 << OBJ_REFCOUNT_BITS) - 2) /* Object allocated in the stack. */
 #define OBJ_FIRST_SPECIAL_REFCOUNT OBJ_STATIC_REFCOUNT
+
+/* The serverObject struct is variable in size. It has several static fields that are always present,
+ * followed by several optional variable-sized fields. The static fields are `type` through `refcount`
+ * in the struct-defined order:
+ *
+ *    +------+----------+-----+-----------+-----------+-----------+----------+----
+ *    | type | encoding | lru | hasexpire | hasembkey | hasembval | refcount | ...
+ *    +------+----------+-----+-----------+-----------+-----------+----------+----
+ *
+ * The optional variable-sized embedded data has 2 possible layouts. If value is embedded (hasembval == 1)
+ *  the `val_ptr` pointer is not used - instead the val data is embedded:
+ *
+ *    +------+----------+-----+------------+----------+--------+-----------------+---------+------------+
+ *    | type | encoding | lru | has* flags | refcount | expire | key_header_size | key sds | value data |
+ *    +------+----------+-----+------------+----------+--------+-----------------+---------+------------+
+ *                                                      ^        ^                 ^         ^
+ *                                                      |        |                 |         |
+ *                                                      |        |                 |         +--- present because hasembval == 1
+ *                                                      |        |                 |
+ *                                                      |        +-----------------+--- present if hasembkey == 1
+ *                                                      |
+ *                                                      +--- present if hasexpire == 1
+ *
+ * Otherwise value is not embedded and we use the `val_ptr` pointer:
+ *
+ *    +------+----------+-----+------------+----------+---------+--------+-----------------+---------+
+ *    | type | encoding | lru | has* flags | refcount | val_ptr | expire | key_header_size | key sds |
+ *    +------+----------+-----+------------+----------+---------+--------+-----------------+---------+
+ *                                                      ^         ^        ^                 ^
+ *                                                      |         |        |                 |
+ *                                                      |         |        +-----------------+--- present if hasembkey == 1
+ *                                                      |         |
+ *                                                      |         +--- present if hasexpire == 1
+ *                                                      |
+ *                                                      +--- present because hasembval == 0
+ */
+
 struct serverObject {
     unsigned type : 4;
     unsigned encoding : 4;
     unsigned lru : LRULFU_BITS;
     unsigned hasexpire : 1;
     unsigned hasembkey : 1;
+    unsigned hasembval : 1;
     unsigned refcount : OBJ_REFCOUNT_BITS;
-    void *ptr;
+    void *val_ptr; /* Not always present. Use objectGetVal(obj) and
+                    * objectSetVal(obj, val) instead. */
 };
+static_assert(sizeof(struct serverObject) <= 8 + sizeof(void *), "unexpected size - verify struct is packed correctly");
 
 /* The string name for an object's type as listed above
  * Native types are checked against the OBJ_STRING, OBJ_LIST, OBJ_* defines,
@@ -832,7 +880,8 @@ char *getObjectTypeName(robj *);
         _var.encoding = OBJ_ENCODING_RAW;    \
         _var.hasexpire = 0;                  \
         _var.hasembkey = 0;                  \
-        _var.ptr = _ptr;                     \
+        _var.hasembval = 0;                  \
+        _var.val_ptr = _ptr;                 \
     } while (0)
 
 struct evictionPoolEntry; /* Defined in evict.c */
@@ -1425,7 +1474,7 @@ struct sharedObjectsStruct {
         *bgsaveerr_variants[2],
         *execaborterr, *noautherr, *noreplicaserr, *busykeyerr, *oomerr, *plus, *messagebulk, *pmessagebulk,
         *subscribebulk, *unsubscribebulk, *psubscribebulk, *punsubscribebulk, *del, *unlink, *rpop, *lpop, *lpush, *zadd,
-        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hdel, *hpexpireat, *hpersist, *srem,
+        *rpoplpush, *lmove, *blmove, *zpopmin, *zpopmax, *emptyscan, *multi, *exec, *left, *right, *hset, *hsetex, *hdel, *hpexpireat, *hpersist, *srem,
         *xgroup, *xclaim, *script, *replconf, *eval, *cluster, *syncslots, *persist, *set, *pexpireat, *pexpire, *time, *pxat, *absttl,
         *retrycount, *force, *justid, *entriesread, *lastid, *ping, *setid, *keepttl, *load, *createconsumer, *getack,
         *special_asterisk, *special_equals, *default_username, *redacted, *ssubscribebulk, *sunsubscribebulk, *fields,
@@ -1440,8 +1489,14 @@ struct sharedObjectsStruct {
 
 /* ZSETs use a specialized version of Skiplists */
 typedef struct zskiplistNode {
-    double score;
-    struct zskiplistNode *backward;
+    union {
+        double score;         /* Sorting score for node ordering. */
+        unsigned long length; /* Number of elements in the skiplist. */
+    };
+    union {
+        struct zskiplistNode *backward; /* Pointer to previous node for reverse traversal. */
+        struct zskiplistNode *tail;     /* Tail element of the skiplist. */
+    };
     struct zskiplistLevel {
         struct zskiplistNode *forward;
         /* At each level we keep the span, which is the number of elements which are on the "subtree"
@@ -1449,14 +1504,19 @@ typedef struct zskiplistNode {
          * One exception is the value at level 0. In level 0 the span can only be 1 or 0 (in case the last elements in the list)
          * So we use it in order to hold the height of the node, which is the number of levels. */
         unsigned long span;
-    } level[];
-    /* After the level[], sds header length (1 byte) and an embedded sds element are stored. */
+    } level[1]; /* Flexible array member - actual levels determined at node creation. */
+    /* For non-header nodes, after the level[], sds header length (1 byte) and an embedded sds element are stored. */
 } zskiplistNode;
 
+/* The header node does not store actual data (no score, no backward pointer,
+ * and its node height is fixed at ZSKIPLIST_MAXLEVEL).
+ * To save memory, we reuse the memory space of these fields in the header node to store:
+ *   - skiplist length (number of elements)
+ *   - tail pointer to the last element
+ *   - maximum current level of the skiplist
+ * For detailed memory layout, refer to the zskiplistNode struct definition. */
 typedef struct zskiplist {
-    struct zskiplistNode *header, *tail;
-    unsigned long length;
-    int level;
+    zskiplistNode header;
 } zskiplist;
 
 typedef struct zset {
@@ -1562,7 +1622,8 @@ typedef struct rdbSaveInfo {
     long long repl_offset;                /* Replication offset. */
 } rdbSaveInfo;
 
-#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1}
+#define RDB_SAVE_INFO_INIT \
+    {-1, 0, "0000000000000000000000000000000000000000", -1}
 
 struct malloc_stats {
     size_t zmalloc_used;
@@ -1582,6 +1643,9 @@ struct malloc_stats {
 #define CACHE_CONN_TYPE_IPv6 (1 << 1)
 #define CACHE_CONN_TYPE_RESP3 (1 << 2)
 #define CACHE_CONN_TYPE_MAX (1 << 3)
+
+#define RESP_CACHE_INDEX_MAX 2                       /* [0]=RESP2, [1]=RESP3 */
+#define RESP_CACHE_INDEX(resp) ((resp) == 3 ? 1 : 0) /* Convert RESP version to cache array index */
 
 /*-----------------------------------------------------------------------------
  * TLS Context Configuration
@@ -1605,6 +1669,7 @@ typedef struct serverTLSContextConfig {
     int session_caching;
     int session_cache_size;
     int session_cache_timeout;
+    int auto_reload_interval;
 } serverTLSContextConfig;
 
 /*-----------------------------------------------------------------------------
@@ -1682,18 +1747,19 @@ typedef enum childInfoType {
 
 struct valkeyServer {
     /* General */
-    pid_t pid;                /* Main process pid. */
-    pthread_t main_thread_id; /* Main thread id */
-    char *configfile;         /* Absolute config file path, or NULL */
-    char *executable;         /* Absolute executable file path. */
-    char **exec_argv;         /* Executable argv vector (copy). */
-    mode_t umask;             /* The umask value of the process on startup */
-    int hz;                   /* serverCron() calls frequency in hertz */
-    int clients_hz;           /* clientsTimeProc() frequency in hertz */
-    int in_fork_child;        /* indication that this is a fork child */
-    serverDb **db;            /* each db created when it's first used */
-    hashtable *commands;      /* Command table */
-    hashtable *orig_commands; /* Command table before command renaming. */
+    pid_t pid;                                        /* Main process pid. */
+    pthread_t main_thread_id;                         /* Main thread id */
+    char *configfile;                                 /* Absolute config file path, or NULL */
+    char *executable;                                 /* Absolute executable file path. */
+    char **exec_argv;                                 /* Executable argv vector (copy). */
+    mode_t umask;                                     /* The umask value of the process on startup */
+    int hz;                                           /* serverCron() calls frequency in hertz */
+    int clients_hz;                                   /* clientsTimeProc() frequency in hertz */
+    int in_fork_child;                                /* indication that this is a fork child */
+    serverDb **db;                                    /* each db created when it's first used */
+    hashtable *commands;                              /* Command table */
+    hashtable *orig_commands;                         /* Command table before command renaming. */
+    sds command_response_cache[RESP_CACHE_INDEX_MAX]; /* Cached COMMAND response: [0]=RESP2, [1]=RESP3 */
     aeEventLoop *el;
     _Atomic AeIoState io_poll_state;     /* Indicates the state of the IO polling. */
     int io_ae_fired_events;              /* Number of poll events received by the IO thread. */
@@ -1882,6 +1948,9 @@ struct valkeyServer {
     long long stat_reply_buffer_shrinks; /* Total number of output buffer shrinks */
     long long stat_reply_buffer_expands; /* Total number of output buffer expands */
     monotime el_start;
+    /* Main thread utilization tracking */
+    monotime stat_active_time; /* Cumulative active time for main thread in microseconds */
+    bool el_iteration_active;  /* Tracks if any work was done in the current event loop iteration */
     /* The following two are used to record the max number of commands executed in one eventloop.
      * Note that commands in transactions are also counted. */
     long long el_cmd_cnt_start;
@@ -2007,6 +2076,18 @@ struct valkeyServer {
     int key_load_delay;                   /* Delay in microseconds between keys while
                                            * loading aof or rdb. (for testings). negative
                                            * value means fractions of microseconds (on average). */
+    /* External storage options.  */
+    int ext_data_mode;                         /* External storage mode */
+    int ext_data_expire;                       /* Enable expiring keys to external storage for allkeys-* policies */
+    size_t ext_min_object_size_to_move;        /* Min size of k/v pair to move to external storage */
+    unsigned long long ext_data_max_disk_size; /* Maximum disk space allowed to be used by external storage */
+    unsigned long long ext_data_max_mem_size;  /* Maximum memory allowed to be used by external storage */
+    unsigned long ext_data_defer_max_ms;       /* Deferred external data module initialization max time */
+    unsigned int ext_data_timeout;             /* Timeout for accessing external storage */
+    unsigned int ext_data_store_by_size;       /* Size to exceed to store externally */
+    int ext_data_async_load;                   /* Load external data asynchronously on replica (1=async, 0=sync) */
+    int ext_data_load_timeout_ms;              /* Timeout in milliseconds for sync external data load */
+    char *ext_data_id;                         /* Node ID for external data module */
     /* Pipe and data structures for child -> parent info sharing. */
     int child_info_pipe[2]; /* Pipe used to write the child_info_data. */
     int child_info_nread;   /* Num of bytes of the last read from pipe */
@@ -2140,8 +2221,6 @@ struct valkeyServer {
     int maxmemory_policy;                       /* Policy for key eviction */
     int maxmemory_samples;                      /* Precision of random sampling */
     int maxmemory_eviction_tenacity;            /* Aggressiveness of eviction processing */
-    int lfu_log_factor;                         /* LFU logarithmic counter factor. */
-    int lfu_decay_time;                         /* LFU counter decay factor. */
     long long proto_max_bulk_len;               /* Protocol bulk length maximum size. */
     int oom_score_adj_values[CONFIG_OOM_COUNT]; /* Linux oom_score_adj configuration */
     int oom_score_adj;                          /* If true, oom_score_adj is managed */
@@ -2285,6 +2364,12 @@ struct valkeyServer {
     int tls_replication;
     int tls_auth_clients;
     serverTLSContextConfig tls_ctx_config;
+    long long tls_server_cert_expire_time;
+    long long tls_client_cert_expire_time;
+    long long tls_ca_cert_expire_time;
+    sds tls_server_cert_serial;
+    sds tls_client_cert_serial;
+    sds tls_ca_cert_serial;
     serverUnixContextConfig unix_ctx_config;
     serverRdmaContextConfig rdma_ctx_config;
     /* cpu affinity */
@@ -2646,6 +2731,7 @@ struct serverCommand {
                                     * (not the fullname), and the value is the serverCommand structure pointer. */
     struct serverCommand *parent;
     struct ValkeyModuleCommand *module_cmd; /* A pointer to the module command data (NULL if native command) */
+    sds info_cache[RESP_CACHE_INDEX_MAX];   /* Cached COMMAND INFO response: [0]=RESP2, [1]=RESP3 */
 };
 
 struct serverError {
@@ -2811,6 +2897,7 @@ void dictVanillaFree(void *val);
 client *createClient(connection *conn);
 void freeClient(client *c);
 void freeClientAsync(client *c);
+void freeClientOrCloseLater(client *c, int async);
 void logInvalidUseAndFreeClientAsync(client *c, const char *fmt, ...);
 void beforeNextClient(client *c);
 void clearClientConnectionState(client *c);
@@ -2857,6 +2944,7 @@ void addReplyOrErrorObject(client *c, robj *reply);
 void afterErrorReply(client *c, const char *s, size_t len, int flags);
 void addReplyErrorFormatInternal(client *c, int flags, const char *fmt, va_list ap);
 void addReplyErrorSdsEx(client *c, sds err, int flags);
+void addReplyErrorSdsExSafe(client *c, sds err, int flags);
 void addReplyErrorSds(client *c, sds err);
 void addReplyErrorSdsSafe(client *c, sds err);
 void addReplyError(client *c, const char *err);
@@ -3036,7 +3124,7 @@ void dismissObject(robj *o, size_t dump_size);
 robj *createObject(int type, void *ptr);
 void initObjectLRUOrLFU(robj *o);
 robj *createStringObject(const char *ptr, size_t len);
-robj *createStringObjectFromSds(const sds s);
+robj *createStringObjectFromSds(const_sds s);
 robj *createRawStringObject(const char *ptr, size_t len);
 robj *tryCreateRawStringObject(const char *ptr, size_t len);
 robj *tryCreateStringObject(const char *ptr, size_t len);
@@ -3079,12 +3167,14 @@ int equalStringObjects(robj *a, robj *b);
 void trimStringObjectIfNeeded(robj *o, int trim_small_values);
 #define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
 
-/* Objects with key attached, AKA valkey (val+key) objects */
-robj *createObjectWithKeyAndExpire(int type, void *ptr, const sds key, long long expire);
-robj *objectSetKeyAndExpire(robj *val, sds key, long long expire);
-robj *objectSetExpire(robj *val, long long expire);
-sds objectGetKey(const robj *val);
-long long objectGetExpire(const robj *val);
+/* Objects with val and/or key embedded */
+robj *objectSetKeyAndExpire(robj *o, const_sds key, long long expire);
+robj *objectSetExpire(robj *o, long long expire);
+void objectSetVal(robj *o, void *val);
+void objectUnembedVal(robj *o);
+void *objectGetVal(const robj *o);
+sds objectGetKey(const robj *o);
+long long objectGetExpire(const robj *o);
 uint8_t objectGetLFUFrequency(robj *o);
 uint32_t objectGetLRUIdleSecs(robj *o);
 uint32_t objectGetIdleness(robj *o);
@@ -3209,6 +3299,7 @@ int isMutuallyExclusiveChildType(int type);
 extern rax *Users;
 extern user *DefaultUser;
 void ACLInit(void);
+int ACLModuleHasCommandRules(const struct ValkeyModule *module, sds *rule_out);
 /* Return values for ACLCheckAllPerm(). */
 #define ACL_OK 0                    /* Permission granted */
 #define ACL_DENIED_DB 1             /* Database access denied */
@@ -3299,6 +3390,12 @@ typedef struct {
 #define ERROR_COMMAND_FAILED (1 << 1)   /* Indicate to update the command failed stats */
 
 zskiplist *zslCreate(void);
+int zslGetHeight(const zskiplist *zsl);
+zskiplistNode *zslGetTail(const zskiplist *zsl);
+void zslSetTail(zskiplist *zsl, zskiplistNode *tail);
+unsigned long zslGetLength(const zskiplist *zsl);
+zskiplistNode *zslGetHeader(zskiplist *zsl);
+size_t zslGetAllocSize(void);
 void zslFree(zskiplist *zsl);
 zskiplistNode *zslInsert(zskiplist *zsl, double score, const_sds ele);
 zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n, long *rank);
@@ -3415,6 +3512,7 @@ sds activeDefragSds(sds sdsptr);
 robj *activeDefragStringOb(robj *ob);
 void dismissSds(sds s);
 void dismissMemoryInChild(void);
+void tlsResetCertInfo(void);
 
 #define RESTART_SERVER_NONE 0
 #define RESTART_SERVER_GRACEFULLY (1 << 0)     /* Do proper shutdown. */
@@ -3481,7 +3579,7 @@ char *hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what, size_t *len);
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
 robj *hashTypeGetValueObject(robj *o, sds field);
-int hashTypeSet(robj *o, sds field, sds value, long long expiry, int flags);
+int hashTypeSet(robj *o, sds field, sds value, long long expiry, int flags, bool *expired_overwritten);
 robj *hashTypeDup(robj *o);
 bool hashTypeHasVolatileFields(robj *o);
 int hashTypeUpdateAsStringRef(robj *o, sds field, const char *buf, size_t len);
@@ -3559,6 +3657,7 @@ int rewriteConfig(char *path, int force_write);
 void initConfigValues(void);
 void removeConfig(sds name);
 sds getConfigDebugInfo(void);
+sds getConfigValue(const char *name);
 int allowProtectedAction(int config, client *c);
 void updateSharedObjectsWithCompat(void);
 void initServerClientMemUsageBuckets(void);
@@ -3601,6 +3700,7 @@ void deleteExpiredKeyAndPropagate(serverDb *db, robj *keyobj);
 void deleteExpiredKeyAndPropagateWithDictIndex(serverDb *db, robj *keyobj, int dict_index);
 void deleteExpiredKeyFromOverwriteAndPropagate(client *c, robj *keyobj);
 void propagateDeletion(serverDb *db, robj *key, int lazy, int slot);
+int propagateFieldsDeletion(serverDb *db, robj *o, size_t n_fields, robj *fields[], int slot);
 size_t dbReclaimExpiredFields(robj *o, serverDb *db, mstime_t now, unsigned long max_entries, int didx);
 int keyIsExpired(serverDb *db, robj *key);
 long long getExpire(serverDb *db, robj *key);
@@ -3609,6 +3709,7 @@ int checkAlreadyExpired(long long when);
 robj *lookupKeyRead(serverDb *db, robj *key);
 robj *lookupKeyWrite(serverDb *db, robj *key);
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply);
+robj *lookupExtKeyReadOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply);
 robj *lookupKeyReadWithFlags(serverDb *db, robj *key, int flags);
 robj *lookupKeyWriteWithFlags(serverDb *db, robj *key, int flags);
@@ -3621,6 +3722,7 @@ int objectSetLRUOrLFU(robj *val, long long lfu_freq, long long lru_idle_secs);
 #define LOOKUP_NOSTATS (1 << 2)  /* Don't update keyspace hits/misses counters. */
 #define LOOKUP_WRITE (1 << 3)    /* Delete expired keys even in replicas. */
 #define LOOKUP_NOEXPIRE (1 << 4) /* Avoid deleting lazy expired keys. */
+#define LOOKUP_EXTDATA (1 << 5)  /* Include searching external data. */
 #define LOOKUP_NOEFFECTS \
     (LOOKUP_NONOTIFY | LOOKUP_NOSTATS | LOOKUP_NOTOUCH | LOOKUP_NOEXPIRE) /* Avoid any effects from fetching the key */
 
@@ -3663,6 +3765,7 @@ size_t lazyfreeGetFreedObjectsCount(void);
 void lazyfreeResetStats(void);
 void freeObjAsync(robj *key, robj *obj, int dbid);
 void freeReplicationBacklogRefMemAsync(list *blocks, rax *index);
+void freePendingReplDataBufAsync(list *pending_repl_data_blocks);
 void dbUntrackKeyWithVolatileItems(serverDb *db, robj *o);
 void dbTrackKeyWithVolatileItems(serverDb *db, robj *o);
 void dbUpdateObjectWithVolatileItemsTracking(serverDb *db, robj *o);
@@ -3699,6 +3802,7 @@ int zmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult
 int bzmpopGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int setGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int bitfieldGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
+int delGetKeys(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result);
 
 unsigned short crc16(const char *buf, int len);
 
@@ -3805,6 +3909,7 @@ void commandCommand(client *c);
 void commandCountCommand(client *c);
 void commandListCommand(client *c);
 void commandInfoCommand(client *c);
+void invalidateCommandCache(void);
 void commandGetKeysCommand(client *c);
 void commandGetKeysAndFlagsCommand(client *c);
 void commandHelpCommand(client *c);
@@ -3995,6 +4100,7 @@ void sunsubscribeCommand(client *c);
 void watchCommand(client *c);
 void unwatchCommand(client *c);
 void clusterCommand(client *c);
+void clusterKeySlotCommand(client *c);
 void clusterFlushslotCommand(client *c);
 void clusterSlotStatsCommand(client *c);
 void restoreCommand(client *c);
@@ -4089,6 +4195,14 @@ void lcsCommand(client *c);
 void quitCommand(client *c);
 void resetCommand(client *c);
 void failoverCommand(client *c);
+void externalDataInitCommand(client *c);
+void externalDataLoadedCommand(client *c);
+void externalDataStatsCommand(client *c);
+void externalDataDropCommand(client *c);
+void externalDataDebugCommand(client *c);
+void externalDataDumpCommand(client *c);
+void externalDataLoadCommand(client *c);
+
 
 /* Helper functions for getting database id args from argv, argc */
 int *selectDbIdArgs(robj **argv, int argc, int *count);
@@ -4158,6 +4272,7 @@ void debugPauseProcess(void);
 #define serverDebugMark() printf("-- MARK %s:%d --\n", __FILE__, __LINE__)
 
 int iAmPrimary(void);
+int isExtDataOn(void);
 
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)

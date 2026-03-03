@@ -8,6 +8,8 @@
 #include "bio.h"
 #include "module.h"
 #include "functions.h"
+#include "external_data.h"
+#include "server.h"
 
 #include <sys/wait.h>
 #include <fcntl.h>
@@ -406,7 +408,7 @@ int clusterRDBLoadSlotImport(rio *rdb) {
         slot_range->end_slot = end_slot;
         listAddNodeTail(slot_ranges, slot_range);
     }
-    slotMigrationJob *new_import = createSlotImportJob(NULL, NULL, job_name->ptr, slot_ranges);
+    slotMigrationJob *new_import = createSlotImportJob(NULL, NULL, objectGetVal(job_name), slot_ranges);
     listAddNodeTail(server.cluster->slot_migration_jobs, new_import);
     decrRefCount(job_name);
     return C_OK;
@@ -546,9 +548,9 @@ void clusterCommandSyncSlotsEstablish(client *c) {
     bool is_tracking_only = c->flag.primary || c->id == CLIENT_ID_AOF;
     int i = 3;
     while (i < c->argc) {
-        if (!strcasecmp(c->argv[i]->ptr, "source")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "source")) {
             if (source_node || i + 1 >= c->argc ||
-                sdslen(c->argv[i + 1]->ptr) != CLUSTER_NAMELEN) {
+                sdslen(objectGetVal(c->argv[i + 1])) != CLUSTER_NAMELEN) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 goto cleanup;
             }
@@ -560,7 +562,7 @@ void clusterCommandSyncSlotsEstablish(client *c) {
                 i += 2;
                 continue;
             }
-            source_node_name = c->argv[i + 1]->ptr;
+            source_node_name = objectGetVal(c->argv[i + 1]);
             source_node = clusterLookupNode(source_node_name, CLUSTER_NAMELEN);
             i += 2;
 
@@ -574,17 +576,17 @@ void clusterCommandSyncSlotsEstablish(client *c) {
             }
             continue;
         }
-        if (!strcasecmp(c->argv[i]->ptr, "name")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "name")) {
             if (name || i + 1 >= c->argc ||
-                sdslen(c->argv[i + 1]->ptr) != CLUSTER_NAMELEN) {
+                sdslen(objectGetVal(c->argv[i + 1])) != CLUSTER_NAMELEN) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 goto cleanup;
             }
-            name = c->argv[i + 1]->ptr;
+            name = objectGetVal(c->argv[i + 1]);
             i += 2;
             continue;
         }
-        if (!strcasecmp(c->argv[i]->ptr, "slotsrange")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "slotsrange")) {
             if (slot_ranges) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 goto cleanup;
@@ -666,6 +668,64 @@ void clusterCommandSyncSlotsSnapshotEof(client *c) {
               "Slot migration %s successfully received slot snapshot. "
               "Beginning incremental stream...",
               c->slot_migration_job->description);
+
+    /* Load external data for each imported slot */
+    if (isExtDataOn()) {
+        /* Get source node address */
+        clusterNode *source_node = clusterLookupNode(c->slot_migration_job->source_node_name, CLUSTER_NAMELEN);
+        if (source_node) {
+            char *source_ip = clusterNodeIp(source_node, NULL);
+            int source_port = getNodeDefaultReplicationPort(source_node);
+            char source_addr[256];
+            snprintf(source_addr, sizeof(source_addr), "%s:%d", source_ip, source_port);
+
+            sds source_addr_sds = sdsnew(source_addr);
+
+            /* Iterate through all databases */
+            for (int dbid = 0; dbid < server.dbnum; dbid++) {
+                externalDataModuleInstance *mi = externalDataGetModuleInstance(dbid);
+                if (!mi) {
+                    continue;
+                }
+
+                /* Iterate through all slot ranges */
+                listIter li;
+                listNode *ln;
+                listRewind(c->slot_migration_job->slot_ranges, &li);
+                while ((ln = listNext(&li)) != NULL) {
+                    slotRange *range = ln->value;
+                    for (int slot = range->start_slot; slot <= range->end_slot; slot++) {
+                        /* Construct backup_id for this specific slot */
+                        sds backup_id_sds = externalDataGetBackupId(source_addr_sds, slot);
+
+                        if (backup_id_sds) {
+                            robj *backup_id_obj = createStringObject(backup_id_sds, sdslen(backup_id_sds));
+                            int result = externalDataCallLoadFunc(mi, (ValkeyModuleString *)backup_id_obj);
+
+                            if (result == EXTERNAL_SUCCESS) {
+                                serverLog(LL_NOTICE, "External data loaded for database %d slot %d from source %s",
+                                          dbid, slot, source_addr);
+                            } else {
+                                serverLog(LL_WARNING, "Failed to load external data for database %d slot %d from source %s",
+                                          dbid, slot, source_addr);
+                            }
+
+                            decrRefCount(backup_id_obj);
+                            sdsfree(backup_id_sds);
+                        } else {
+                            serverLog(LL_WARNING, "Failed to construct backup_id for database %d slot %d from source %s",
+                                      dbid, slot, source_addr);
+                        }
+                    }
+                }
+            }
+
+            sdsfree(source_addr_sds);
+        } else {
+            serverLog(LL_WARNING, "Could not find source node for external data load");
+        }
+    }
+
     sendSyncSlotsMessage(c->slot_migration_job, "REQUEST-PAUSE");
     updateSlotMigrationJobState(c->slot_migration_job,
                                 SLOT_IMPORT_WAITING_FOR_PAUSED);
@@ -726,31 +786,31 @@ void clusterCommandSyncSlotsFinish(client *c) {
     char *message = NULL;
     int i = 3;
     while (i < c->argc) {
-        if (!strcasecmp(c->argv[i]->ptr, "state")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "state")) {
             if (state || i + 1 >= c->argc) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 return;
             }
-            state = c->argv[i + 1]->ptr;
+            state = objectGetVal(c->argv[i + 1]);
             i += 2;
             continue;
         }
-        if (!strcasecmp(c->argv[i]->ptr, "name")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "name")) {
             if (name || i + 1 >= c->argc ||
-                sdslen(c->argv[i + 1]->ptr) != CLUSTER_NAMELEN) {
+                sdslen(objectGetVal(c->argv[i + 1])) != CLUSTER_NAMELEN) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 return;
             }
-            name = c->argv[i + 1]->ptr;
+            name = objectGetVal(c->argv[i + 1]);
             i += 2;
             continue;
         }
-        if (!strcasecmp(c->argv[i]->ptr, "message")) {
+        if (!strcasecmp(objectGetVal(c->argv[i]), "message")) {
             if (message || i + 1 >= c->argc) {
                 addReplyErrorObject(c, shared.syntaxerr);
                 return;
             }
-            message = c->argv[i + 1]->ptr;
+            message = objectGetVal(c->argv[i + 1]);
             i += 2;
             continue;
         }
@@ -1155,7 +1215,7 @@ void clusterCommandMigrateSlots(client *c) {
     list *slot_ranges = NULL;
 
     while (curr_index < c->argc) {
-        if (strcasecmp(c->argv[curr_index]->ptr, "slotsrange")) {
+        if (strcasecmp(objectGetVal(c->argv[curr_index]), "slotsrange")) {
             addReplyErrorObject(c, shared.syntaxerr);
             goto cleanup;
         }
@@ -1196,21 +1256,21 @@ void clusterCommandMigrateSlots(client *c) {
         }
 
         if (curr_index + 1 >= c->argc ||
-            strcasecmp(c->argv[curr_index]->ptr, "node")) {
+            strcasecmp(objectGetVal(c->argv[curr_index]), "node")) {
             addReplyErrorObject(c, shared.syntaxerr);
             goto cleanup;
         }
         curr_index++;
-        if (sdslen(c->argv[curr_index]->ptr) != CLUSTER_NAMELEN) {
+        if (sdslen(objectGetVal(c->argv[curr_index])) != CLUSTER_NAMELEN) {
             addReplyErrorFormat(c, "Invalid node name: %s",
-                                (sds)c->argv[curr_index]->ptr);
+                                (sds)objectGetVal(c->argv[curr_index]));
             goto cleanup;
         }
-        clusterNode *target_node = clusterLookupNode(c->argv[curr_index]->ptr,
+        clusterNode *target_node = clusterLookupNode(objectGetVal(c->argv[curr_index]),
                                                      CLUSTER_NAMELEN);
         if (!target_node) {
             addReplyErrorFormat(c, "Unknown node name: %s",
-                                (sds)c->argv[curr_index]->ptr);
+                                (sds)objectGetVal(c->argv[curr_index]));
             goto cleanup;
         }
         if (target_node == server.cluster->myself) {
@@ -1444,8 +1504,7 @@ int slotExportTryDoPause(slotMigrationJob *job) {
 
     if (server.debug_slot_migration_prevent_pause ||
         (server.slot_migration_max_failover_repl_bytes >= 0 &&
-         getClientOutputBufferMemoryUsage(job->client) >
-             (size_t)server.slot_migration_max_failover_repl_bytes)) {
+         job->client->reply_bytes > (size_t)server.slot_migration_max_failover_repl_bytes)) {
         return C_ERR;
     }
     serverLog(LL_NOTICE,
@@ -2066,6 +2125,39 @@ void proceedWithSlotMigration(slotMigrationJob *job) {
                                        "Failed to start snapshot");
                 return;
             }
+
+            /* Dump external data for each slot being migrated */
+            if (isExtDataOn()) {
+                /* Get target node address */
+                clusterNode *target_node = clusterLookupNode(job->target_node_name, CLUSTER_NAMELEN);
+                if (target_node) {
+                    /* Iterate through all databases */
+                    for (int dbid = 0; dbid < server.dbnum; dbid++) {
+                        externalDataModuleInstance *mi = externalDataGetModuleInstance(dbid);
+                        if (!mi) {
+                            continue;
+                        }
+
+                        /* Iterate through all slot ranges */
+                        listIter li;
+                        listNode *ln;
+                        listRewind(job->slot_ranges, &li);
+                        while ((ln = listNext(&li)) != NULL) {
+                            slotRange *range = ln->value;
+                            for (int slot = range->start_slot; slot <= range->end_slot; slot++) {
+                                int result = externalDataCallDumpFunc(mi, slot, mstime(), NULL);
+                                if (result != EXTERNAL_SUCCESS) {
+                                    serverLog(LL_WARNING, "Failed to dump external data for database %d slot %d", dbid, slot);
+                                }
+                            }
+                        }
+                    }
+
+                } else {
+                    serverLog(LL_WARNING, "Could not find target node for external data dump");
+                }
+            }
+
             updateSlotMigrationJobState(job, SLOT_EXPORT_SNAPSHOTTING);
             return;
         case SLOT_EXPORT_SNAPSHOTTING:
@@ -2345,6 +2437,24 @@ void finishSlotMigrationJob(slotMigrationJob *job,
     if (job->type == SLOT_MIGRATION_EXPORT) {
         if (state == SLOT_MIGRATION_JOB_SUCCESS) {
             fireModuleSlotMigrationEvent(job, VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_EXPORT_COMPLETED);
+
+            /* Clean up external data from source after successful export */
+            if (isExtDataOn()) {
+                listIter li;
+                listNode *ln;
+                listRewind(job->slot_ranges, &li);
+                while ((ln = listNext(&li)) != NULL) {
+                    slotRange *range = ln->value;
+                    for (int slot = range->start_slot; slot <= range->end_slot; slot++) {
+                        /* Flush external data for this specific slot on all databases */
+                        for (int dbid = 0; dbid < server.dbnum; dbid++) {
+                            externalDataFlushDb(dbid, slot);
+                        }
+
+                        serverLog(LL_NOTICE, "External data cleaned up for exported slot %d", slot);
+                    }
+                }
+            }
         } else {
             fireModuleSlotMigrationEvent(job, VALKEYMODULE_SUBEVENT_ATOMIC_SLOT_MIGRATION_EXPORT_ABORTED);
         }
@@ -2389,7 +2499,7 @@ void clusterCommandGetSlotMigrations(client *c) {
     listRewind(server.cluster->slot_migration_jobs, &li);
     while ((ln = listNext(&li)) != NULL) {
         slotMigrationJob *job = ln->value;
-        addReplyMapLen(c, job->is_tracking_only ? 9 : 11);
+        addReplyMapLen(c, job->is_tracking_only ? 10 : 12);
         addReplyBulkCString(c, "name");
         addReplyBulkCBuffer(c, job->name, CLUSTER_NAMELEN);
         addReplyBulkCString(c, "operation");
@@ -2416,6 +2526,12 @@ void clusterCommandGetSlotMigrations(client *c) {
         addReplyBulkCString(c, job->status_msg ? job->status_msg : "");
         addReplyBulkCString(c, "cow_size");
         addReplyLongLong(c, (long long)job->stat_cow_bytes);
+        addReplyBulkCString(c, "remaining_repl_size");
+        if (job->type == SLOT_MIGRATION_EXPORT && job->client) {
+            addReplyLongLong(c, (long long)job->client->reply_bytes);
+        } else {
+            addReplyLongLong(c, 0);
+        }
     }
 }
 
@@ -2565,12 +2681,12 @@ void clusterCommandSyncSlotsCapa(client *c) {
  * with slot import. */
 void clusterCommandSyncSlots(client *c) {
     /* Commands used by primary and replica */
-    if (!strcasecmp(c->argv[2]->ptr, "establish")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "establish")) {
         /* CLUSTER SYNCSLOTS ESTABLISH <args> */
         clusterCommandSyncSlotsEstablish(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "finish")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "finish")) {
         /* CLUSTER SYNCSLOTS FINISH <args> */
         clusterCommandSyncSlotsFinish(c);
         return;
@@ -2578,37 +2694,37 @@ void clusterCommandSyncSlots(client *c) {
 
     /* Commands only used by primary (ignored on replica) */
     if (c->flag.primary) return;
-    if (!strcasecmp(c->argv[2]->ptr, "snapshot-eof")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "snapshot-eof")) {
         /* CLUSTER SYNCSLOTS SNAPSHOT-EOF */
         clusterCommandSyncSlotsSnapshotEof(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "request-pause")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "request-pause")) {
         /* CLUSTER SYNCSLOTS REQUEST-PAUSE */
         clusterCommandSyncSlotsRequestPause(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "paused")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "paused")) {
         /* CLUSTER SYNCSLOTS PAUSED */
         clusterCommandSyncSlotsPaused(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "request-failover")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "request-failover")) {
         /* CLUSTER SYNCSLOTS REQUEST-FAILOVER */
         clusterCommandSyncSlotsRequestFailover(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "failover-granted")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "failover-granted")) {
         /* CLUSTER SYNCSLOTS FAILOVER-GRANTED */
         clusterCommandSyncSlotsFailoverGranted(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "ack")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "ack")) {
         /* CLUSTER SYNCSLOTS ACK */
         clusterCommandSyncSlotsAck(c);
         return;
     }
-    if (!strcasecmp(c->argv[2]->ptr, "capa")) {
+    if (!strcasecmp(objectGetVal(c->argv[2]), "capa")) {
         /* CLUSTER SYNCSLOTS CAPA <field> [<field>...] */
         clusterCommandSyncSlotsCapa(c);
         return;

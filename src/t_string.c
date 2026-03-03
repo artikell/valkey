@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2009-2012, Redis Ltd.
  * All rights reserved.
@@ -32,7 +33,10 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+#include "external_data.h"
+#include "sds.h"
 #include "server.h"
+#include "valkeymodule.h"
 #include <math.h> /* isnan(), isinf() */
 
 /* Forward declarations */
@@ -46,7 +50,7 @@ static int checkStringLength(client *c, long long size, long long append) {
     if (mustObeyClient(c)) return C_OK;
     /* 'uint64_t' cast is there just to prevent undefined behavior on overflow */
     long long total = (uint64_t)size + append;
-    /* Test configured max-bulk-len represending a limit of the biggest string object,
+    /* Test configured max-bulk-len representing a limit of the biggest string object,
      * and also test for overflow. */
     if (total > server.proto_max_bulk_len || total < size || total < append) {
         addReplyError(c, "string exceeds maximum allowed size (proto-max-bulk-len)");
@@ -57,6 +61,11 @@ static int checkStringLength(client *c, long long size, long long append) {
 
 /* Forward declaration */
 static int getExpireMillisecondsOrReply(client *c, robj *expire, int flags, int unit, long long *milliseconds);
+
+static int checkKVShouldBeExternallyStored(robj *key, robj *val, int flags) {
+    return (
+        isExtDataOn() && (flags & ARGS_SET_EXT || (server.ext_data_store_by_size && (sdslen(objectGetVal(key)) + sdslen(objectGetVal(val)) > server.ext_data_store_by_size))));
+}
 
 /* The setGenericCommand() function implements the SET operation with different
  * options and variants. This function is called in order to implement the
@@ -97,6 +106,54 @@ void setGenericCommand(client *c,
 
     robj *existing_value = lookupKeyWrite(c->db, key);
     found = existing_value != NULL;
+
+    int should_be_ext = checkKVShouldBeExternallyStored(key, val, flags);
+    if (should_be_ext) {
+        int result = externalDataWrite(c->db->id, key, val);
+        if (result == EXTERNAL_READONLY) {
+            blockPostponeClient(c);
+            return;
+        } else if (result == EXTERNAL_ERROR) {
+            /* Module returned error - send error reply to client */
+            /* Note: Module's detailed error message is lost due to teardownModuleCtx,
+             * so we send a generic error here */
+            if (!mustObeyClient(c)) {
+                addReplyError(c, "External storage operation failed");
+            }
+        } else {
+            // Success
+            if (found) dbDelete(c->db, key);
+
+            /* Only send OK reply to non-replicated clients.
+             * Replicated clients (from primary/AOF) should not receive replies. */
+            if (!mustObeyClient(c)) {
+                addReply(c, ok_reply ? ok_reply : shared.ok);
+            }
+
+            /* Propagate the SET command with EXT flag to replicas and AOF.
+             * This ensures replicas also store the data externally. */
+            server.dirty++;
+            notifyKeyspaceEvent(NOTIFY_STRING, "set", key, c->db->id);
+
+            /* Propagate the command to replicas and AOF */
+            int propagate_to_aof = server.aof_state != AOF_OFF;
+            int propagate_to_repl = listLength(server.replicas) > 0;
+            if (propagate_to_aof || propagate_to_repl) {
+                robj *ext_argv[4];
+                ext_argv[0] = shared.set;
+                ext_argv[1] = key;
+                ext_argv[2] = val;
+                ext_argv[3] = createStringObject("EXT", 3);
+
+                if (propagate_to_aof) feedAppendOnlyFile(c->db->id, ext_argv, 4);
+                if (propagate_to_repl) replicationFeedReplicas(c->db->id, ext_argv, 4);
+
+                /* Free the created EXT string object to avoid memory leak */
+                decrRefCount(ext_argv[3]);
+            }
+        }
+        goto cleanup;
+    }
 
     /* Handle the IFEQ conditional check */
     if (flags & ARGS_SET_IFEQ && found) {
@@ -171,7 +228,7 @@ void setGenericCommand(client *c,
         int j;
         robj **argv = zmalloc((c->argc - 1) * sizeof(robj *));
         for (j = 0; j < c->argc; j++) {
-            char *a = c->argv[j]->ptr;
+            char *a = objectGetVal(c->argv[j]);
             /* Skip GET which may be repeated multiple times. */
             if (j >= 3 && (a[0] == 'g' || a[0] == 'G') && (a[1] == 'e' || a[1] == 'E') &&
                 (a[2] == 't' || a[2] == 'T') && a[3] == '\0')
@@ -280,8 +337,13 @@ void delifeqCommand(client *c) {
 int getGenericCommand(client *c) {
     robj *o;
 
-    if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
-        return C_OK;
+    if (c->argc == 3 && !strcasecmp(objectGetVal(c->argv[2]), "ext")) {
+        if ((o = lookupExtKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
+            return C_OK;
+    } else {
+        if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
+            return C_OK;
+    }
 
     if (checkType(c, o, OBJ_STRING)) {
         return C_ERR;
@@ -324,18 +386,18 @@ void getexCommand(client *c) {
         return;
     }
 
+    /* Validate the expiration time value first */
+    long long milliseconds = 0;
+    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
+        return;
+    }
+
     robj *o;
 
     if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)
         return;
 
     if (checkType(c, o, OBJ_STRING)) {
-        return;
-    }
-
-    /* Validate the expiration time value first */
-    long long milliseconds = 0;
-    if (expire && getExpireMillisecondsOrReply(c, expire, flags, unit, &milliseconds) != C_OK) {
         return;
     }
 
@@ -400,7 +462,7 @@ void getsetCommand(client *c) {
 void setrangeCommand(client *c) {
     robj *o;
     long offset;
-    sds value = c->argv[3]->ptr;
+    sds value = objectGetVal(c->argv[3]);
 
     if (getLongFromObjectOrReply(c, c->argv[2], &offset, NULL) != C_OK)
         return;
@@ -446,12 +508,12 @@ void setrangeCommand(client *c) {
         o = dbUnshareStringValue(c->db, c->argv[1], o);
     }
 
-    o->ptr = sdsgrowzero(o->ptr, offset + sdslen(value));
-    memcpy((char *)o->ptr + offset, value, sdslen(value));
+    objectSetVal(o, sdsgrowzero(objectGetVal(o), offset + sdslen(value)));
+    memcpy((char *)objectGetVal(o) + offset, value, sdslen(value));
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING, "setrange", c->argv[1], c->db->id);
     server.dirty++;
-    addReplyLongLong(c, sdslen(o->ptr));
+    addReplyLongLong(c, sdslen(objectGetVal(o)));
 }
 
 void getrangeCommand(client *c) {
@@ -469,9 +531,9 @@ void getrangeCommand(client *c) {
 
     if (o->encoding == OBJ_ENCODING_INT) {
         str = llbuf;
-        strlen = ll2string(llbuf, sizeof(llbuf), (long)o->ptr);
+        strlen = ll2string(llbuf, sizeof(llbuf), (long)objectGetVal(o));
     } else {
-        str = o->ptr;
+        str = objectGetVal(o);
         strlen = sdslen(str);
     }
 
@@ -574,7 +636,7 @@ void incrDecrCommand(client *c, long long incr) {
     if (o && o->refcount == 1 && o->encoding == OBJ_ENCODING_INT &&
         value >= LONG_MIN && value <= LONG_MAX) {
         new = o;
-        o->ptr = (void *)((long)value);
+        objectSetVal(o, (void *)((long)value));
     } else {
         new = createStringObjectFromLongLongForValue(value);
         if (o) {
@@ -667,13 +729,13 @@ void appendCommand(client *c) {
 
         /* "append" is an argument, so always an sds */
         append = c->argv[2];
-        if (checkStringLength(c, stringObjectLen(o), sdslen(append->ptr)) != C_OK)
+        if (checkStringLength(c, stringObjectLen(o), sdslen(objectGetVal(append))) != C_OK)
             return;
 
         /* Append the value */
         o = dbUnshareStringValue(c->db, c->argv[1], o);
-        o->ptr = sdscatlen(o->ptr, append->ptr, sdslen(append->ptr));
-        totlen = sdslen(o->ptr);
+        objectSetVal(o, sdscatlen(objectGetVal(o), objectGetVal(append), sdslen(objectGetVal(append))));
+        totlen = sdslen(objectGetVal(o));
     }
     signalModifiedKey(c, c->db, c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING, "append", c->argv[1], c->db->id);
@@ -710,11 +772,11 @@ void lcsCommand(client *c) {
     }
     obja = obja ? getDecodedObject(obja) : createStringObject("", 0);
     objb = objb ? getDecodedObject(objb) : createStringObject("", 0);
-    a = obja->ptr;
-    b = objb->ptr;
+    a = objectGetVal(obja);
+    b = objectGetVal(objb);
 
     for (j = 3; j < (uint32_t)c->argc; j++) {
-        char *opt = c->argv[j]->ptr;
+        char *opt = objectGetVal(c->argv[j]);
         int moreargs = (c->argc - 1) - j;
 
         if (!strcasecmp(opt, "IDX")) {

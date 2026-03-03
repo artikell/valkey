@@ -37,6 +37,8 @@
 #include "module.h"
 #include "cluster_migrateslots.h"
 #include "eval.h"
+#include "lrulfu.h"
+#include "external_data.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -117,6 +119,11 @@ configEnum repl_diskless_load_enum[] = {
     {"flush-before-load", REPL_DISKLESS_LOAD_FLUSH_BEFORE_LOAD},
     {NULL, 0}};
 
+configEnum ext_data_mode_enum[] = {
+    {"no", EXT_DATA_NONE},
+    {"kv", EXT_DATA_KV},
+    {NULL, 0}};
+
 configEnum tls_auth_clients_enum[] = {
     {"no", TLS_CLIENT_AUTH_NO},
     {"yes", TLS_CLIENT_AUTH_YES},
@@ -165,7 +172,7 @@ configEnum propagation_error_behavior_enum[] = {
     {"panic-on-replicas", PROPAGATION_ERR_BEHAVIOR_PANIC_ON_REPLICAS},
     {NULL, 0}};
 
-configEnum log_format_enum[] = {{"legacy", LOG_FORMAT_LEGACY}, {"logfmt", LOG_FORMAT_LOGFMT}, {NULL, 0}};
+configEnum log_format_enum[] = {{"legacy", LOG_FORMAT_LEGACY}, {"logfmt", LOG_FORMAT_LOGFMT}, {"json", LOG_FORMAT_JSON}, {NULL, 0}};
 
 configEnum log_timestamp_format_enum[] = {{"legacy", LOG_TIMESTAMP_LEGACY},
                                           {"iso8601", LOG_TIMESTAMP_ISO8601},
@@ -818,11 +825,11 @@ void configSetCommand(client *c) {
 
     /* Find all relevant configs */
     for (i = 0; i < config_count; i++) {
-        standardConfig *config = lookupConfig(c->argv[2 + i * 2]->ptr);
+        standardConfig *config = lookupConfig(objectGetVal(c->argv[2 + i * 2]));
         /* Fail if we couldn't find this config */
         if (!config) {
             if (!invalid_args) {
-                invalid_arg_name = c->argv[2 + i * 2]->ptr;
+                invalid_arg_name = objectGetVal(c->argv[2 + i * 2]);
                 invalid_args = 1;
             }
             continue;
@@ -843,7 +850,7 @@ void configSetCommand(client *c) {
             (config->flags & PROTECTED_CONFIG && !allowProtectedAction(server.enable_protected_configs, c))) {
             /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
             errstr = (config->flags & IMMUTABLE_CONFIG) ? "can't set immutable config" : "can't set protected config";
-            err_arg_name = c->argv[2 + i * 2]->ptr;
+            err_arg_name = objectGetVal(c->argv[2 + i * 2]);
             invalid_args = 1;
             continue;
         }
@@ -860,14 +867,14 @@ void configSetCommand(client *c) {
             if (set_configs[j] == config) {
                 /* Note: we don't abort the loop since we still want to handle redacting sensitive configs (above) */
                 errstr = "duplicate parameter";
-                err_arg_name = c->argv[2 + i * 2]->ptr;
+                err_arg_name = objectGetVal(c->argv[2 + i * 2]);
                 invalid_args = 1;
                 break;
             }
         }
         set_configs[i] = config;
         config_names[i] = config->name;
-        new_values[i] = c->argv[2 + i * 2 + 1]->ptr;
+        new_values[i] = objectGetVal(c->argv[2 + i * 2 + 1]);
     }
 
     if (invalid_args) goto err;
@@ -969,7 +976,7 @@ void configGetCommand(client *c) {
     dict *matches = dictCreate(&externalStringType);
     for (i = 0; i < c->argc - 2; i++) {
         robj *o = c->argv[2 + i];
-        sds name = o->ptr;
+        sds name = objectGetVal(o);
 
         /* If the string doesn't contain glob patterns, just directly
          * look up the key in the dictionary. */
@@ -1456,7 +1463,7 @@ void rewriteConfigUserOption(struct rewriteConfigState *state) {
         line = sdscatsds(line, u->name);
         line = sdscatlen(line, " ", 1);
         robj *descr = ACLDescribeUser(u);
-        line = sdscatsds(line, descr->ptr);
+        line = sdscatsds(line, objectGetVal(descr));
         decrRefCount(descr);
         rewriteConfigRewriteLine(state, "user", line, 1);
     }
@@ -1689,6 +1696,19 @@ sds getConfigDebugInfo(void) {
     rewriteConfigReleaseState(state);
     return info;
 }
+/* Get a single configuration value as a string by name.
+ * Returns NULL if the config doesn't exist.
+ * The returned sds must be freed by the caller. */
+sds getConfigValue(const char *name) {
+    sds name_sds = sdsnew(name);
+    standardConfig *config = lookupConfig(name_sds);
+    sdsfree(name_sds);
+
+    if (!config) return NULL;
+
+    return config->interface.get(config);
+}
+
 
 /* This function replaces the old configuration file with the new content
  * in an atomic manner.
@@ -2746,6 +2766,7 @@ static int applyTlsCfg(const char **err) {
         *err = "Unable to update TLS configuration. Check server logs.";
         return 0;
     }
+    tlsResetCertInfo();
     return 1;
 }
 
@@ -2767,7 +2788,7 @@ static int applyTLSPort(const char **err) {
         *err = "Unable to listen on this port. Check server logs.";
         return 0;
     }
-
+    tlsResetCertInfo();
     return 1;
 }
 
@@ -3197,6 +3218,19 @@ static int isValidDbHashSeed(sds val, const char **err) {
     return 1;
 }
 
+/* Validate that ext-data-id is set when ext-data-mode is enabled */
+static int validateExtDataId(sds val, const char **err) {
+    if (!isExtDataOn()) {
+        return 1;
+    }
+
+    if (sdslen(val) == 0) {
+        *err = "ext-data-id must be set when ext-data-mode is enabled";
+        return 0;
+    }
+    return 1;
+}
+
 standardConfig static_configs[] = {
     /* Bool configs */
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
@@ -3251,6 +3285,9 @@ standardConfig static_configs[] = {
     createBoolConfig("hide-user-data-from-log", NULL, MODIFIABLE_CONFIG, server.hide_user_data_from_log, 1, NULL, NULL),
     createBoolConfig("lua-enable-insecure-api", "lua-enable-deprecated-api", MODIFIABLE_CONFIG | HIDDEN_CONFIG | PROTECTED_CONFIG, server.lua_enable_insecure_api, 0, NULL, updateLuaEnableInsecureApi),
     createBoolConfig("import-mode", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.import_mode, 0, NULL, NULL),
+    createBoolConfig("ext-data-expire", NULL, MODIFIABLE_CONFIG, server.ext_data_expire, 0, NULL, NULL),
+    createBoolConfig("ext-data-async-load", NULL, MODIFIABLE_CONFIG, server.ext_data_async_load, 1, NULL, NULL),
+    createIntConfig("ext-data-load-timeout-ms", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.ext_data_load_timeout_ms, 10000, INTEGER_CONFIG, NULL, NULL),
 
     /* String Configs */
     createStringConfig("aclfile", NULL, IMMUTABLE_CONFIG, ALLOW_EMPTY_STRING, server.acl_filename, "", NULL, NULL),
@@ -3281,6 +3318,7 @@ standardConfig static_configs[] = {
     createStringConfig("req-res-logfile", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, EMPTY_STRING_IS_NULL, server.req_res_logfile, NULL, NULL, NULL),
 #endif
     createStringConfig("locale-collate", NULL, MODIFIABLE_CONFIG, ALLOW_EMPTY_STRING, server.locale_collate, "", NULL, updateLocaleCollate),
+    createStringConfig("ext-data-id", NULL, IMMUTABLE_CONFIG, EMPTY_STRING_IS_NULL, server.ext_data_id, "", validateExtDataId, NULL),
     createStringConfig("debug-context", NULL, MODIFIABLE_CONFIG | DEBUG_CONFIG | HIDDEN_CONFIG, ALLOW_EMPTY_STRING, server.debug_context, "", NULL, NULL),
 
     /* SDS Configs */
@@ -3309,6 +3347,7 @@ standardConfig static_configs[] = {
     createEnumConfig("log-format", NULL, MODIFIABLE_CONFIG, log_format_enum, server.log_format, LOG_FORMAT_LEGACY, NULL, NULL),
     createEnumConfig("log-timestamp-format", NULL, MODIFIABLE_CONFIG, log_timestamp_format_enum, server.log_timestamp_format, LOG_TIMESTAMP_LEGACY, NULL, NULL),
     createEnumConfig("rdb-version-check", NULL, MODIFIABLE_CONFIG, rdb_version_check_enum, server.rdb_version_check, RDB_VERSION_CHECK_STRICT, NULL, NULL),
+    createEnumConfig("ext-data-mode", NULL, IMMUTABLE_CONFIG, ext_data_mode_enum, server.ext_data_mode, EXT_DATA_NONE, NULL, NULL),
 
     /* Integer configs */
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.config_databases, 16, INTEGER_CONFIG, NULL, NULL),
@@ -3330,8 +3369,8 @@ standardConfig static_configs[] = {
     createIntConfig("active-defrag-threshold-lower", NULL, MODIFIABLE_CONFIG, 0, 1000, server.active_defrag_threshold_lower, 10, INTEGER_CONFIG, NULL, NULL),                       /* Default: don't defrag when fragmentation is below 10% */
     createIntConfig("active-defrag-threshold-upper", NULL, MODIFIABLE_CONFIG, 0, 1000, server.active_defrag_threshold_upper, 100, INTEGER_CONFIG, NULL, updateDefragConfiguration), /* Default: maximum defrag force at 100% fragmentation */
     createIntConfig("active-defrag-cycle-us", NULL, MODIFIABLE_CONFIG, 0, 100000, server.active_defrag_cycle_us, 500, INTEGER_CONFIG, NULL, updateDefragConfiguration),
-    createIntConfig("lfu-log-factor", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.lfu_log_factor, 10, INTEGER_CONFIG, NULL, NULL),
-    createIntConfig("lfu-decay-time", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.lfu_decay_time, 1, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("lfu-log-factor", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, lfu_config_log_factor, 10, INTEGER_CONFIG, NULL, NULL),
+    createIntConfig("lfu-decay-time", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, lfu_config_decay_time, 1, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("replica-priority", "slave-priority", MODIFIABLE_CONFIG, 0, INT_MAX, server.replica_priority, 100, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("repl-diskless-sync-delay", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.repl_diskless_sync_delay, 5, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("maxmemory-samples", NULL, MODIFIABLE_CONFIG, 1, 64, server.maxmemory_samples, 5, INTEGER_CONFIG, NULL, NULL),
@@ -3371,6 +3410,8 @@ standardConfig static_configs[] = {
 #ifdef LOG_REQ_RES
     createUIntConfig("client-default-resp", NULL, IMMUTABLE_CONFIG | HIDDEN_CONFIG, 2, 3, server.client_default_resp, 2, INTEGER_CONFIG, NULL, NULL),
 #endif
+    createUIntConfig("ext-data-timeout", NULL, MODIFIABLE_CONFIG, 0, 100, server.ext_data_timeout, 1, INTEGER_CONFIG, NULL, NULL),
+    createUIntConfig("ext-data-store-by-size", NULL, MODIFIABLE_CONFIG, 0, UINT_MAX, server.ext_data_store_by_size, 0, INTEGER_CONFIG, NULL, NULL),
 
     /* Unsigned Long configs */
     createULongConfig("active-defrag-max-scan-fields", NULL, MODIFIABLE_CONFIG, 1, LONG_MAX, server.active_defrag_max_scan_fields, 1000, INTEGER_CONFIG, NULL, NULL), /* Default: keys with more than 1000 fields will be processed separately */
@@ -3380,6 +3421,7 @@ standardConfig static_configs[] = {
     createULongConfig("acllog-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.acllog_max_len, 128, INTEGER_CONFIG, NULL, NULL),
     createULongConfig("cluster-blacklist-ttl", NULL, MODIFIABLE_CONFIG, 0, ULONG_MAX, server.cluster_blacklist_ttl, 60, INTEGER_CONFIG, NULL, NULL),
     createULongConfig("cluster-slot-migration-log-max-len", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.cluster_slot_migration_log_max_len, 1000, INTEGER_CONFIG, NULL, NULL),
+    createULongConfig("ext-data-defer-max-ms", NULL, MODIFIABLE_CONFIG, 0, LLONG_MAX, server.ext_data_defer_max_ms, 30000, INTEGER_CONFIG, NULL, NULL),
 
     /* Long Long configs */
     createLongLongConfig("busy-reply-threshold", "lua-time-limit", MODIFIABLE_CONFIG, 0, LONG_MAX, server.busy_reply_threshold, 5000, INTEGER_CONFIG, NULL, NULL), /* milliseconds */
@@ -3397,6 +3439,8 @@ standardConfig static_configs[] = {
     /* Unsigned Long Long configs */
     createULongLongConfig("maxmemory", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.maxmemory, 0, MEMORY_CONFIG, NULL, updateMaxmemory),
     createULongLongConfig("cluster-link-sendbuf-limit", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.cluster_link_msg_queue_limit_bytes, 0, MEMORY_CONFIG, NULL, NULL),
+    createULongLongConfig("ext-data-max-disk-size", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.ext_data_max_disk_size, 0, MEMORY_CONFIG, NULL, NULL),
+    createULongLongConfig("ext-data-max-mem-size", NULL, MODIFIABLE_CONFIG, 0, ULLONG_MAX, server.ext_data_max_mem_size, 0, MEMORY_CONFIG, NULL, NULL),
 
     /* Size_t configs */
     createSizeTConfig("hash-max-listpack-entries", "hash-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_entries, 512, INTEGER_CONFIG, NULL, NULL),
@@ -3411,6 +3455,7 @@ standardConfig static_configs[] = {
     createSizeTConfig("hll-sparse-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.hll_sparse_max_bytes, 3000, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("tracking-table-max-keys", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.tracking_table_max_keys, 1000000, INTEGER_CONFIG, NULL, NULL),                                      /* Default: 1 million keys max. */
     createSizeTConfig("client-query-buffer-limit", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, 1024 * 1024, LONG_MAX, server.client_max_querybuf_len, 1024 * 1024 * 1024, MEMORY_CONFIG, NULL, NULL), /* Default: 1GB max query buffer. */
+    createSizeTConfig("ext-min-object-size-to-move", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.ext_min_object_size_to_move, 0, MEMORY_CONFIG, NULL, NULL),
     createSSizeTConfig("maxmemory-clients", NULL, MODIFIABLE_CONFIG, -100, SSIZE_MAX, server.maxmemory_clients, 0, MEMORY_CONFIG | PERCENT_CONFIG, NULL, applyClientMaxMemoryUsage),
     createSSizeTConfig("slot-migration-max-failover-repl-bytes", NULL, MODIFIABLE_CONFIG, -1, SSIZE_MAX, server.slot_migration_max_failover_repl_bytes, 0, MEMORY_CONFIG, NULL, NULL),
 
@@ -3423,6 +3468,7 @@ standardConfig static_configs[] = {
     createIntConfig("tls-port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.tls_port, 0, INTEGER_CONFIG, NULL, applyTLSPort), /* TCP port. */
     createIntConfig("tls-session-cache-size", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_size, 20 * 1024, INTEGER_CONFIG, NULL, applyTlsCfg),
     createIntConfig("tls-session-cache-timeout", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.session_cache_timeout, 300, INTEGER_CONFIG, NULL, applyTlsCfg),
+    createIntConfig("tls-auto-reload-interval", NULL, MODIFIABLE_CONFIG, 0, INT_MAX, server.tls_ctx_config.auto_reload_interval, 0, INTEGER_CONFIG, NULL, applyTlsCfg),
     createBoolConfig("tls-cluster", NULL, MODIFIABLE_CONFIG, server.tls_cluster, 0, NULL, applyTlsCfg),
     createBoolConfig("tls-replication", NULL, MODIFIABLE_CONFIG, server.tls_replication, 0, NULL, applyTlsCfg),
     createEnumConfig("tls-auth-clients", NULL, MODIFIABLE_CONFIG, tls_auth_clients_enum, server.tls_auth_clients, TLS_CLIENT_AUTH_YES, NULL, NULL),
