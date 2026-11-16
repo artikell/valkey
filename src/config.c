@@ -842,7 +842,7 @@ static void restoreBackupConfig(standardConfig **set_configs,
 
 /* Match configs by name or pattern. Returns a dict of matched configs. */
 static dict *matchSinglePatternToConfigs(sds pattern) {
-    dict *matches = dictCreate(&externalStringType);
+    dict *matches = dictCreate(&externalStringFxDictType);
 
     /* If the string doesn't contain glob patterns, just directly
      * look up the key in the dictionary. */
@@ -873,7 +873,7 @@ static dict *matchSinglePatternToConfigs(sds pattern) {
 
 /* Match config patterns from arguments. Returns a dict of all matched configs (deduplicated). */
 static dict *matchPatternsToConfigs(robj **patterns, int pattern_count) {
-    dict *all_matches = dictCreate(&externalStringType);
+    dict *all_matches = dictCreate(&externalStringFxDictType);
     dictIterator *di;
     dictEntry *de;
 
@@ -1134,14 +1134,14 @@ void rewriteConfigSentinelOption(struct rewriteConfigState *state);
  */
 dictType optionToLineDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashFunction = dictSdsCaseFxHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKeyListValue,
 };
 
 dictType optionSetDictType = {
     .entryGetKey = dictEntryGetKey,
-    .hashFunction = dictSdsCaseHash,
+    .hashFunction = dictSdsCaseFxHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKey,
 };
@@ -3749,7 +3749,7 @@ int registerConfigValue(const char *name, const standardConfig *config, int alia
 /* Initialize configs to their default values and create and populate the
  * runtime configuration dictionary. */
 void initConfigValues(void) {
-    configs = dictCreate(&sdsHashDictType);
+    configs = dictCreate(&sdsHashFxDictType);
     dictExpand(configs, sizeof(static_configs) / sizeof(standardConfig));
     for (standardConfig *config = static_configs; config->name != NULL; config++) {
         if (config->interface.init) config->interface.init(config);

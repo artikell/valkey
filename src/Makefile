@@ -549,6 +549,7 @@ ENGINE_SERVER_OBJ = \
     evict.o \
     expire.o \
     fbtree.o \
+    fxhash.o \
     fifo.o \
 	forkless.o \
     functions.o \

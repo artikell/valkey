@@ -32,6 +32,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #include "server.h"
+#include "fxhash.h"
 #include "hotkeys.h"
 #include "ordered_index.h"
 #include "connection.h"
@@ -458,6 +459,25 @@ uint64_t dictCStrCaseHash(const void *key) {
     return dictGenCaseHashFunction(key, strlen((char *)key));
 }
 
+/* FxHasher-backed wrappers for internal hash tables whose keys are trusted
+ * identifiers. The sds variants read the sds length; the C string variants
+ * rely on the NUL terminator, matching the dict*Hash wrappers above. */
+uint64_t dictSdsFxHash(const void *key) {
+    return fxHash64((const uint8_t *)key, sdslen(key));
+}
+
+uint64_t dictSdsCaseFxHash(const void *key) {
+    return fxHash64Case((const uint8_t *)key, sdslen(key));
+}
+
+uint64_t dictCStrFxHash(const void *key) {
+    return fxHash64((const uint8_t *)key, strlen((const char *)key));
+}
+
+uint64_t dictCStrCaseFxHash(const void *key) {
+    return fxHash64Case((const uint8_t *)key, strlen((const char *)key));
+}
+
 /* Hash function for client */
 uint64_t hashtableClientHash(const void *key) {
     return ((client *)key)->id;
@@ -730,19 +750,19 @@ hashtableType kvstoreExpiresHashtableType = {
 
 /* Command set, hashed by current command name, stores serverCommand structs. */
 hashtableType commandSetType = {.entryGetKey = hashtableCommandGetCurrentName,
-                                .hashFunction = dictSdsCaseHash,
+                                .hashFunction = dictSdsCaseFxHash,
                                 .keyCompare = dictCStrKeyCaseCompare,
                                 .instant_rehashing = 1};
 
 /* Command set, hashed by original command name, stores serverCommand structs. */
 hashtableType originalCommandSetType = {.entryGetKey = hashtableCommandGetOriginalName,
-                                        .hashFunction = dictSdsCaseHash,
+                                        .hashFunction = dictSdsCaseFxHash,
                                         .keyCompare = dictCStrKeyCaseCompare,
                                         .instant_rehashing = 1};
 
 /* Sub-command set, hashed by char* string, stores serverCommand structs. */
 hashtableType subcommandSetType = {.entryGetKey = hashtableSubcommandGetKey,
-                                   .hashFunction = dictCStrCaseHash,
+                                   .hashFunction = dictCStrCaseFxHash,
                                    .keyCompare = dictCStrKeyCaseCompare,
                                    .instant_rehashing = 1};
 
@@ -862,6 +882,37 @@ dictType externalStringType = {
 dictType sdsHashDictType = {
     .entryGetKey = dictEntryGetKey,
     .hashFunction = dictSdsCaseHash,
+    .keyCompare = dictSdsKeyCaseCompare,
+    .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
+};
+
+/* FxHasher-backed counterparts of the generic types above. Same callbacks and
+ * key contracts, only the hash function differs. Use these only for trusted,
+ * internally generated keys (see fxhash.h); keep the SipHash originals for any
+ * table whose key provenance is not fully trusted. */
+
+/* FxHasher variant of stringSetDictType (case-insensitive section/option
+ * name sets). */
+dictType stringSetFxDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictCStrCaseFxHash,
+    .keyCompare = dictCStrKeyCaseCompare,
+    .entryDestructor = dictEntryDestructorSdsKey,
+};
+
+/* FxHasher variant of externalStringType (borrowed config name keys, no key
+ * destructor). */
+dictType externalStringFxDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictCStrCaseFxHash,
+    .keyCompare = dictCStrKeyCaseCompare,
+    .entryDestructor = zfree,
+};
+
+/* FxHasher variant of sdsHashDictType (the runtime config registry). */
+dictType sdsHashFxDictType = {
+    .entryGetKey = dictEntryGetKey,
+    .hashFunction = dictSdsCaseFxHash,
     .keyCompare = dictSdsKeyCaseCompare,
     .entryDestructor = dictEntryDestructorSdsKeyHeapValue,
 };
@@ -6443,13 +6494,13 @@ dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, i
         /* In this case we know the dict is not gonna be modified, so we cache
          * it as an optimization for a common case. */
         if (cached_default_info_sections) return cached_default_info_sections;
-        cached_default_info_sections = dictCreate(&stringSetDictType);
+        cached_default_info_sections = dictCreate(&stringSetFxDictType);
         dictExpand(cached_default_info_sections, 16);
         addInfoSectionsToDict(cached_default_info_sections, defaults);
         return cached_default_info_sections;
     }
 
-    dict *section_dict = dictCreate(&stringSetDictType);
+    dict *section_dict = dictCreate(&stringSetFxDictType);
     dictExpand(section_dict, min(argc, 16));
     for (int i = 0; i < argc; i++) {
         if (!strcasecmp(objectGetVal(argv[i]), "default")) {

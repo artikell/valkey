@@ -58,7 +58,7 @@ static void metricsDestructor(void *entry) {
 
 static hashtableType metricsHashtableType = {
     .entryGetKey = metricsGetKey,
-    .hashFunction = dictSdsHash,
+    .hashFunction = dictSdsFxHash,
     .keyCompare = dictSdsKeyCompare,
     .entryDestructor = metricsDestructor,
 };
